@@ -1,0 +1,21 @@
+# HyperDrive - fast, portable, self-contained file manager.
+# Copyright (C) 2026 dragon. SPDX-License-Identifier: GPL-3.0-or-later
+
+[package]
+name = "hyperdrive"
+version = "0.1.0"
+edition = "2021"
+description = "Fast, portable, self-contained file manager"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+eframe = "=0.27.2"
+rodio = "0.19"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+zip = "=0.6.6"
+
+[profile.release]
+opt-level = 2
+lto = false
+codegen-units = 16

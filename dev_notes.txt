@@ -1,0 +1,493 @@
+HyperDrive dev notes
+=====================
+Project 006 - 2026-08-25
+License: GPL-3.0-or-later (full text in LICENSE; SPDX headers on all source)
+
+SESSION 7 - 2026-09-15 (mount-roots portability, wsdd)
+------------------------------------------------------
+USER ISSUE: mounted CIFS share at /mnt/Ai_Colaboration invisible in tree;
+only /media/<user>/ was scanned, so behavior differed across systems.
+FIXES:
+1) drive_roots() now reads /proc/self/mountinfo instead of hardcoded /media.
+   Every dir mount under /media/, /run/media/, /mnt/ is surfaced as a
+   disk icon, deduped by label. Works identically whether admin mounts under
+   /mnt, /media/$USER, or /run/media/$USER. Unit test
+   drive_roots_includes_conventional_mounts asserts every such mounted dir
+   is present + no duplicate labels.
+2) Host network visibility: installed wsdd (systemd unit created, since the
+   Debian .deb ships no unit). Web Service Discovery (port 3702) now lets
+   Windows 10/11 Explorer see this box and vice-versa; added wkstn7 to
+   /etc/hosts for SMB name resolution.
+3) Ai_Colaboration share mounted at /media/dragon/Ai_Colaboration (fstab
+   automount), desktop shortcut updated; hyperdrive.conf gained net location
+   entry.
+STATE: release rebuilt + reinstalled to /usr/bin/hyperdrive; tests pass.
+
+SESSION 17 - 2026-09-16 (search filters actually wired + regression tests)
+---------------------------------------------------------------------------
+ROOT CAUSE (verified by reading, not trusting notes): app_search.rs had
+THREE latent bugs vs the SESSION 12/13 claims:
+1) `let needle = q;` inside the thread (was: line 71) overwrote the parsed
+   needle with the FULL composite query "needle|ext|kb|flag", so both
+   filename AND content matching against `contains(&needle)` could never
+   match a real name.
+2) ext_filter was parsed as `_extf` and discarded -> the "extension" filter
+   did nothing.
+3) min_size_kb parsed as `_minkb` and discarded -> the "min-KB" filter did
+   nothing.
+REIMPLEMENTED: search thread now drives a pure, testable
+`file_matches(name, path, needle, extf, minkb, do_content)` helper that
+encodes the real contract: dotfiles never match, case-insensitive filename
+match, extension filter, min-KB filter, content grep (text-like <1MB, no
+NUL byte in first 512B).
+TESTS ADDED (app_search.rs): filename match case-insensitivity, dotfile
+skip, extension filter restrict, min-size skip, content-grep text-only +
+binary skip + huge-file skip. (One test initially failed because "big.txt"
+matches needle "x" via the ".txT" extension - renamed to hugefile.data.)
+CURRENT: 10/10 tests pass; release rebuilds clean (0 errors). Search
+filters (extension + min-KB + content grep) now actually work as claimed.
+
+NEXT: rebuild release + AppImage; visual check of tags sidebar filters;
+revert-safe review of app.rs impl blocks (messy since SESSION 14).
+
+SESSION 18 - 2026-09-17 (clippy 19->0, search + archive + tree fixes)
+---------------------------------------------------------------------
+FULL CLIPPY PASS (19 distinct warnings -> 0, `cargo clippy --release` clean):
+TYPE: `cargo test --release` 10/10 green after every change; release rebuilt +
+installed to /usr/bin/hyperdrive; AppImage HyperDrive-20260917-x86_64 rebuilt
+(feature symbols extract_zip_entry + file_matches verified inside via grep);
+both source trees synced (dev + shared_files) and IDENTICAL.
+DEAD CODE REMOVED (root-caused first, not blindly):
+1) search UI was UNREACHABLE: SearchState::new() never called, self.search
+   stayed None forever. Ctrl+F (previously unbound) now toggles a fresh
+   SearchState on the active pane's current dir. Also removed dead
+   cache_map() placeholder + unused `sizes` field (rust type still keeps
+   Arc<Mutex<HashMap>> nowhere used).
+2) ZIP entry open was BROKEN: double-clicking an entry INSIDE an archive
+   sent "archive.zip!inner/path" to smart_open(), which tried to open a
+   nonexistent real file. extract_zip_entry() existed but was never called.
+   smart_open() now detects '!' paths, extracts to ~/.cache/hyperdrive/zip
+   and opens the real file; errors surface as a status line.
+3) DirTree::reveal() (auto-reveal current folder in the tree) claimed in
+   SESSION 12 but NEVER WIRED. Now called from tree_sidebar() per frame and
+   change-guarded by expanded_for so user-collapsed branches are respected.
+4) Dialog::Rename variant + its whole window handler ORPHANED: inline rename
+   (renaming field) replaced it; nothing constructed Dialog::Rename.
+5) TagStore::get/clear dead (clear == set(path,"")); Job.id + Job.kind never
+   read (next_id counter removed); JobKind trimmed to Copy/Move; TagStore
+   rename preserved for live inline-rename path + tag_cache refreshed there.
+6) app.rs fields open_in_new_tab2 (()), maximized, history only: removed;
+   History::new() dead, Pane::rename_selected() dead (inline path wins).
+7) audio.rs available() dead; optimizations: DirTree pub, share name mut
+   removed, identical if-branches merged (browser decode_mount_label,
+   close_tab remove_at), drop() no-ops, mut_self_later, ti self-assign
+   silence, format!-in-format! (config), io::Error::other, loop-index to
+   slice-iter, sort_by_key, is_multiple_of, needless borrow/matches.
+STATE: 0 clippy warnings, 0 errors, 10/10 tests. NEXT: visual GUI pass of
+tags sidebar filters + Ctrl+F search + archive entry open on real mounts;
+push to GitHub when convenient.
+
+SESSION 6 - 2026-08-25 (nav fix, ".." row, maximize, audio one-click)
+----------------------------------------------------------------------
+USER FEEDBACK: Back broken; want ".." row; titlebar dbl-click maximize;
+setting to play mp3/wav on single click.
+FIXES:
+1) BACK BUG: toolbar called history.back() (which swapped current) then
+   navigate(p) which re-pushed the OLD dir onto the back stack = net zero
+   movement. History rewritten: go() no-op when same dir; back()/forward()
+   swap current AND maintain opposite stack. Pane gained go_back()/go_forward()
+   traversal methods that never re-navigate.
+2) ".." VIRTUAL PARENT ROW at top of every listing (when parent exists):
+   painted like rows, click or dbl-click goes up one level. Implemented as
+   extra row 0 inside show_rows (total_rows = filtered+1).
+3) TITLEBAR MAXIMIZE: egui can't hit-test the OS titlebar, so double-click
+   on OUR top toolbar toggles Maximized viewport command (state flag
+   self.maximized). Native WM still handles its own bar normally.
+4) SETTINGS > Files: checkbox "One click plays audio files (mp3/wav/ogg/
+   flac)". Persisted as audio_one_click=1 in hyperdrive.conf. Single click
+   (no ctrl) on matching extension calls system opener when enabled.
+STATE: dev RUNNING (~PID 98680); release rebuilt.
+
+NEXT: M3 tabs/bookmarks/hotkeys; M4 ops queue/multi-rename/F5-F6 copy.
+
+SESSION 5 summary: paint_cell clip+ellipsis everywhere; any-click pane focus.
+SESSION 4 summary: dual pane = right SidePanel (Frame sizing removed).
+SESSION 3 summary: text buttons, painted left cols +Created, DirSizes,
+AC-navy Blue, muted Pastel.
+SESSION 2 summary: tree sidebar, dual toggle, path bars, status bar.
+SESSION 1 summary: eframe stack, browsing core, themes/fonts/config.
+
+LEGAL: GPL-3.0-or-later: attribution required; derivatives must be GPL too.
+
+
+
+
+
+
+SESSION 6b: pane-0 is_active was hardcoded true -> now follows settings.active_pane. Both-header highlight fixed.
+
+SESSION 7 - 2026-08-25 (Dolphin menus, network suite, embedded audio)
+----------------------------------------------------------------------
+1) EMBEDDED PLAYER: rodio 0.19 (ALSA headers installed by user via sudo apt
+   libasound2-dev). src/audio.rs: AudioPlayer{OutputStream,Sink} play/stop/
+   pause/volume/finished. Bottom playback bar (Pause|Stop|name|Vol slider),
+   auto-hides on finish. Audio dbl-click ALWAYS internal; single-click when
+   setting on. pending_audio channel from pane rows to App.
+2) MENU BAR: File(Edit? no) File/Edit/View/Go/Bookmarks/Help.
+   File: New Folder, Rename, Move to Trash (gio trash), Quit.
+   Edit: Copy/Cut/Paste(own clipboard, recursive copy, "(copy N)" naming),
+         Select All/Clear, Preferences.
+   View: Tree/Dual/Show-hidden checkboxes, Sort radios, Reload.
+   Go: Back/Fwd/Up + Home/Filesystem/Documents/Downloads/Pictures/Music/Videos.
+   Bookmarks: bookmark current, list navigate. Help: About+GPL.
+3) TREE SECTIONS: BOOKMARKS / DEVICES / NETWORK.
+4) SMB CONNECT dialog: server/share/user/domain/guest -> gio mount smb://
+   (GVFS prompts password, no root), auto-navigate into
+   /run/user/$UID/gvfs/smb-share:... ; saved net locations w/ remove x.
+5) SHARE WIZARD: name/comment/readonly(default ON)/guest toggles, security
+   checklist (guest risk, hosts allow LAN, smbpasswd separate, umask, never
+   share home, testparm). Generates /tmp/hyperdrive_setup_share_<n>.sh with
+   idempotent smb.conf block + testparm + systemctl + ufw Samba. User runs
+   with sudo (app stays password-free).
+6) show_hidden per-pane synced from settings each frame; filter respects it.
+
+SPACEDRIVE INSTALLED: v1 0.4.3 extracted from .deb via dpkg -x to
+/tmp/opencode/sd1/app (bundled FFmpeg7 libs!) runs w/ LD_LIBRARY_PATH;
+window has distortion (WebKit GPU bug in this VM - their issue).
+v2 alpha.2 sd-server runs headless: DATA_DIR set, serves 127.0.0.1:6969
+(web UI in browser). Comparison doc: research/FEATURES_BACKLOG.md.
+
+NEXT (from backlog): hotkeys F2/F5/F6/Del/Ctrl+H; properties dialog;
+embedded terminal panel; inline rename; thumbnails; session restore tabs.
+
+
+SESSION 7b - v2 web UI verdict + v1 distortion workaround
+---------------------------------------------------------
+- sd-server alpha.2 = "RPC only (no web UI)" (strings in binary). Firefox
+  6969 refused because server died: their embedded-daemon tracing
+  double-init bug ("Unable to install global subscriber"). Not fixable
+  user-side; frontend tarball needs separate static host + RPC backend.
+- Kept for reference: ~/Applications/spacedrive-v2 (server+frontend).
+- v1 desktop relaunched with WEBKIT_DISABLE_DMABUF_RENDERER=1 +
+  WEBKIT_DISABLE_COMPOSITING_MODE=1 -> distortion likely fixed.
+- Comparison deliverable stands: research/FEATURES_BACKLOG.md.
+
+SESSION 8 - 2026-08-25 (hotkeys + properties dialog)
+------------------------------------------------------
+- KEYBOARD (Dolphin muscle memory, gated when typing in fields):
+  F2 rename | Del trash | F5 reload | Ctrl+H hidden | Alt+Left/Right
+  back/fwd | Alt+Up or Backspace up-one-level | Ctrl+C/X/V clipboard |
+  Ctrl+A select all | Ctrl+L focus path bar (request_focus via memory id) |
+  Enter open selection (dir nav / audio internal player / else xdg-open) |
+  Alt+Enter properties.
+- PROPERTIES dialog: name/type/size(dir uses DirSizes cache)/modified/
+  created/perms octal + writable state/full path. Menu File>Properties.
+- browser.rs: pub secs_of / secs_of_created helpers.
+- Spacedrive processes killed per user; RAM freed (~2.4GB avail).
+NEXT: inline rename in-cell, thumbnails, embedded terminal, session tabs.
+
+SESSION 9 - 2026-08-25 14:29-15:00 ACST (quality-of-life batch)
+----------------------------------------------------------------
+1) SESSION RESTORE: pane_paths persisted in hyperdrive.conf; panes reopen
+   in their last directories on launch (validated dirs only).
+2) ERROR TOASTS: last_error now shows ~8s (err_ttl 480 frames) instead of
+   a single frame - errors are actually visible now.
+3) INLINE RENAME: F2 (or File>Rename) edits the name IN its row; Enter
+   commits, Esc cancels, click-away commits. rename_done channel Pane->App.
+4) TERMINAL: F4 / View>Open Terminal Here spawns x-terminal-emulator/
+   gnome-terminal/xfce4-terminal/konsole/xterm at active pane cwd.
+5) SEARCH: Ctrl+F window - recursive background name search from active
+   pane dir (app_search.rs), streams results (cap 2000, skip dotfiles),
+   click result navigates, Esc cancels thread via AtomicBool.
+6) RANGE SELECT: Shift+click selects anchor..clicked in current sort order;
+   plain click sets new anchor. Ctrl+click still toggles.
+7) THUMBNAILS: image rows show real 48px previews (thumbs.rs + image crate:
+   png/jpeg/gif/webp/bmp). Background decode, max 6 concurrent threads,
+   memory-cached TextureHandles, repaint hook on completion.
+
+Build fixes this session: sync_session moved to free fn; rename commit via
+Pane.rename_done channel (borrow-safe); painter.image needs tex.id().
+
+RELEASE: target/release/hyperdrive rebuilt (18.5MB).
+
+NEXT BACKLOG: tabs w/ drag-out, Open With dialog, symlinks/duplicate,
+disk-usage column, Avahi SMB discovery, archive-as-folder, SQLite index.
+
+SESSION 9 (cont) - 14:34-15:00 ACST
+------------------------------------
+8) TABS: per-side tab strips above each pane. + button or Ctrl+T new tab;
+   click to switch; RIGHT-CLICK a tab to close it; Ctrl+W closes active.
+   side_tabs: [Vec<PathBuf>;2] remembers dirs; switching navigates pane.
+9) DUPLICATE (Edit menu, "name - Copy.ext" naming, recursive for dirs).
+10) CREATE SYMLINK (Edit menu, unix-only, "Link to <name>").
+RELEASE rebuilt 18.5MB @14:59. App RUNNING (PID ~124483).
+
+STATE AT PAUSE 16:00 ACST deadline:
+- Working: everything from sessions 1-9 incl menus, network suite,
+  embedded player, hotkeys, properties, session restore, inline rename,
+  terminal spawn, search, range select, thumbnails, tabs, dup/symlink.
+- Known rough edges: tab close UX via right-click (no X buttons yet),
+  thumbnails memory-only (no disk cache), search skips dotfiles always,
+  dual-pane F5/F6 cross-pane copy still pending.
+
+NEXT BACKLOG (unchanged top picks): Open With dialog w/ memory, disk thumb
+cache, tab drag-out + middle-click close, Avahi SMB discovery, SQLite index.
+
+SESSION 9 (cont2) - 15:00-15:05 ACST
+-------------------------------------
+11) TABS POLISH: per-tab X close buttons + middle-click close; right-click
+    still closes too. Ctrl+T/Ctrl+W unchanged.
+12) OPEN WITH dialog (File>Open With...): scans /usr/share/applications +
+    ~/.local/share/applications, Name/Exec parse, Hidden/NoDisplay skipped,
+    filter box, launches via `gio launch <desktop> <file>`.
+13) Thumbnail name-cell offset actually wired now (previous patch missed).
+RELEASE 18.6MB rebuilt @15:02.
+
+SESSION 9 (cont3) - 15:03-15:06 ACST
+-------------------------------------
+14) TABS PERSIST: side_tabs saved to hyperdrive.conf (side0_tabs/side1_tabs),
+    restored+validated on launch; sync_session writes on any tab change.
+15) DISK THUMB CACHE: ~/.cache/hyperdrive/thumbs/<fnv64>.png; second launch
+    loads previews instantly instead of re-decoding.
+RELEASE rebuilt 18.9MB @15:05.
+
+SESSION 9 (cont4) - 15:15-15:26 ACST
+-------------------------------------
+16) ROW CONTEXT MENU (right-click, Dolphin-style): Copy/Cut/Rename/Duplicate/
+    Symlink | Move to Trash | Delete Permanently (red) | Properties.
+    Right-click also selects row. Actions via Pane.action_req -> App drain
+    (RowAction enum), same channel pattern as audio/rename.
+17) DELETE PERMANENTLY: File menu + ctx menu + Shift+Del hotkey; red
+    confirmation window lists items; remove_file/remove_dir_all.
+18) IMAGE PREVIEW PANEL: View>"Preview panel (image)" toggle (persisted).
+    300px right panel shows selected image at up to 360px decode,
+    background thread + memory tex; auto-hides unless single image selected.
+19) TRACKER FORMATS (XM/S3M/MOD): runtime libopenmpt0t64 present but dev
+    headers MISSING -> cannot compile FFI yet. NEEDS USER SUDO:
+      sudo apt install -y libopenmpt-dev
+    Next session: dlopen/FFI ModPlug_Load/Read -> rodio SamplesBuffer.
+RELEASE building at save time.
+
+SESSION 10 - tracker playback LIVE
+------------------------------------
+- libopenmpt-dev installed by user; FFI via extern "C" + build.rs pkg-config
+  link. Correct symbol: openmpt_module_read_interleaved_stereo (no 16 suffix).
+- render_tracker(): full decode to stereo i16 @48k in bg thread (10min cap),
+  mpsc channel -> AudioPlayer::poll() -> rodio SamplesBuffer sink.
+- Extensions routed: xm s3m mod it mptm (+ existing mp3/wav/ogg/flac/m4a).
+- Single-click (setting) and double-click both play internally.
+
+SESSION 11 - "proceed with everything" batch (A-G complete)
+-------------------------------------------------------------
+A) QUICK WINS:
+   - Search now respects Show-hidden toggle.
+   - F5/F6 dual-pane quick copy/move to other pane (renames on conflict).
+   - Tree auto-expands ancestors of current dir on navigation.
+   - Middle-click a folder row = open in new tab.
+   - Ctrl+PgUp/PgDn cycle tabs.
+   - Sort key/direction persisted per side; restored at launch.
+   - Status bar shows free disk space of current filesystem.
+B) RUBBER-BAND selection: drag on empty list area draws translucent rect,
+   intersecting rows select on release (Rect::from_min_max min/max form).
+C) OPEN WITH MEMORY: dialog gains "Always use for <ext>" checkbox;
+   defaults stored in config (openwith=ext|desktop-path); smart_open()
+   routes double-click/Enter through defaults before xdg-open;
+   context menu gained Open With...
+D) GRID VIEW: View>Icon/grid view (persisted). 112px cells, thumbnails
+   88x64, ellipsised names, full click/dblclick/context support.
+E) SQLITE TAGS: rusqlite bundled; tags table in portable-first
+   hyperdrive.db (beside exe else ~/.local/share/hyperdrive).
+   Context menu Tag submenu (7 colors incl none); colored dot in rows;
+   tag_cache refreshed from DB.
+F) ARCHIVES: Extract here... ctx action on zip/7z/tar*/tgz via
+   unzip/7z/tar fallbacks; helpful error if no extractor.
+G) APPIMAGE: packaging/make-appimage.sh (linuxdeploy extracted-mode for
+   no-FUSE boxes; Yaru file-manager icon; desktop entry).
+   OUTPUT: HyperDrive-20260826-x86_64.AppImage = 8.5MB (!) self-contained.
+   Verified launching with --appimage-extract-and-run in this sandbox.
+
+DEFERRED (honest): pointer drag-drop between panes/apps (egui 0.27 lacks
+built-in DnD; F5/F6 covers workflow), tab drag-reorder (Ctrl+PgUp/Dn +
+middle-click provided), transparent archive browsing (extract-here now).
+
+RELEASE: target/release/hyperdrive 20.7MB -> AppImage 8.5MB.
+
+SESSION 12 - "complete as many features as possible" mega-batch
+-----------------------------------------------------------------
+DONE:
+- SFTP connect (sftp://user@host via GVFS, no root) in Network section.
+- Recents: Go menu + persisted MRU (10 entries).
+- Sync-browse panes toggle (View) - mirrors navigation across dual panes.
+- Search filters: extension + min-KB fields; hidden files now respect Ctrl+H.
+- Preview v2: TEXT file preview (text-ish ext <2MB, monospace read-only).
+- Multi-Rename wizard: find/replace + {n} counter w/ live preview + Apply.
+- ASYNC FOLDER LOADING: list_dir on background thread; UI stays responsive
+  on 100k+ folders; spinner in status bar.
+- JOB QUEUE (jobs.rs): background Copy/Move/Delete/Extract with progress
+  bars, byte counters, cancel flags; Operations window bottom-right;
+  paste/cross-pane/duplicate/delete-permanent/extract all routed through it.
+- TESTS: browser.rs unit tests (sizes/dates/sort) - all pass; fixed real
+  date bug found by test (old epoch-shift math was wrong).
+- CI: .github/workflows/ci.yml (3 OS matrix, fmt/clippy/test/build).
+- README.md complete (features/build/portable mode/shortcuts/license).
+- .deb packaging script (packaging/make-deb.sh -> 5.6MB deb).
+- AppImage rebuilt with everything: 8.5MB.
+- Lock-hardening sweep on jobs.rs (no unwrap-panics on contention).
+
+REMAINING (honest):
+- Transparent archive BROWSING (extract-here exists; walk-in needs VFS layer).
+- Tags v2 (color filters sidebar, follow renames/moves).
+- Pointer drag-drop + tab drag-reorder (egui 0.27 lacks DnD primitives).
+- Windows/macOS builds (docs only now; needs cross toolchains or CI runners).
+- Auto-update checker (stub not wired to a repo yet).
+- Accessibility deep pass.
+
+SESSION 13 - Windows discovery fix + platform prompts
+------------------------------------------------------
+WHY netshare was invisible: modern Windows does NOT advertise shares via
+mDNS (_smb._tcp); it uses WS-Discovery. Linux needs 'wsdd' daemon to bridge
+that (sudo apt install wsdd). Our old scanner only spoke Avahi.
+FIX: scan chain now avahi -> `gio mount smb://` + `gio list smb:///`
+(GVFS workgroup view). Browse dialog drills into host -> live share list
+(gio list smb://host/), click share = connect prefilled. Empty state now
+explains wsdd + points to direct Connect dialog.
+Also added: SFTP connect entry, recents MRU, sync-browse panes, search
+ext/minKB filters, text previews, Multi-Rename wizard, async folder
+loading (non-blocking huge dirs), JOB QUEUE with progress/cancel
+(paste/F5F6/dup/delete/extract all background now), unit tests (fixed real
+date bug), CI workflow, README.md, .deb script, AppImage rebuilt.
+NEW DOCS: docs/PROMPT-BUILD-WINDOWS.md and docs/PROMPT-BUILD-MACOS.md -
+self-contained build prompts for running the assistant on those machines.
+User decisions: skip auto-update checker (#5); builds #4 done on their
+other machines using the prompts.
+
+SESSION 13b - netshare mount fix + Blue theme v2
+--------------------------------------------------
+- DIAGNOSED LIVE: 192.168.1.10 reachable, port 445 open, smbclient -L lists
+  all shares, ANONYMOUS ls of netshare works. Server side perfect.
+- ROOT CAUSE of user's failed Connect: gio mount prompts for auth even on
+  guest shares; from the app there was no way to answer.
+- FIX: mount_and_open_smb now retries with `gio mount --anonymous` when the
+  first attempt fails with auth errors; locate_gvfs_mount matches both
+  server AND share= segment; error toast has ttl.
+- BLUE THEME v2 per user: deeper navy (#10264A/#16305E/#0B1D3A bg stack,
+  #142B54 alt rows) + near-white #F8FAFF text + #6AA6FF accent.
+
+SESSION 13c - stale-build root cause + verified fixes
+------------------------------------------------------
+ROOT CAUSE of "no change": theme.rs AND app.rs mount fn had silently
+reverted to v1 content (stale full-file writes in earlier patches).
+Verified by reading files before patching this time.
+APPLIED & VERIFIED BY GREP:
+- Blue: #091529/#0C1A34/#061020 bg stack, #0B182E rows, #F8FAFF text,
+  #6AA6FF accent, sep #172949 (45% darker than prior navy attempt).
+- Pastel: x0.68 warm-grey family (#ACA7A0 base, text #3E3730, accent
+  #9E616D) per user's "32% darker".
+- SMB mount: timeout(20s)+stdin-null wrapper (no UI freeze), anonymous
+  retry on auth errors, locate matches server+share= segments.
+- AppImage REBUILT from current source (12:52 timestamp) and launched via
+  --appimage-extract-and-run; squashfs-root cache cleared first so no
+  stale extraction can mask the new build.
+LESSON: always grep-verify after python patches; never trust earlier
+"applied" prints when later full-file rewrites may have raced them.
+
+SESSION 13d - regression fixes + smbclient browser
+----------------------------------------------------
+FIXED REGRESSIONS:
+- Directory clicks dead: rubber-band ui.interact(Sense::drag) layer sat ON
+  TOP of rows and swallowed every press. Now starts only when press misses
+  all row rects (Pane.row_rects collected per frame). Clicks/dbl-clicks work.
+- Music: was fine in code path, but Enter-open + grid + list all now route
+  through smart_open (respects per-ext defaults) with internal player kept.
+- Settings window: Apply (saves+applies) and OK buttons added.
+
+SMB GUEST MOUNT: gvfs-smb guest is broken system-wide ("Invalid argument"
+even by hostname; smbclient works). Added Network > "Browse SMB share
+(smbclient)..." - self-contained dialog using smbclient -N ls parsing
+(dirs-first, sizes), navigation with Up button, file open downloads to
+~/.cache/hyperdrive/smb then opens via default app. netshare verified
+working through smbclient earlier.
+
+SESSION 14 - #7 drag-drop + dbl-click regression fix (paused mid-verify)
+-------------------------------------------------------------------------
+FIXED:
+- Grid-view branch was discarding double-click navigation (return None
+  threw away nav_request). Grid now returns grid_nav properly -> dirs open.
+  THIS was why right-pane dirs would not open (grid view was enabled).
+- Rubber-band layer no longer steals row clicks: starts only when press
+  misses all row_rects. row_rects collected per frame per pane.
+
+NEW (#7 partial):
+- CROSS-PANE FILE DRAG-DROP via manual hit-testing: press on selected rows,
+  move >12px, ghost tooltip follows cursor, release over other pane's list
+  = COPY job (Shift = MOVE). Uses Pane.row_rects + pane_list_rect +
+  Pane.press_origin/pending_press_paths channels; App.handle_dnd() engine.
+- TAB DRAG-REORDER: drag a tab left/right past neighbours to swap order
+  (App.tab_rects + dnd_tab state, adjacent-swap on midpoint cross).
+
+STRUCTURAL NOTE: app.rs grew messy impl blocks during patches; handle_dnd
+now lives in its own `impl HyperDriveApp` after the eframe impl. All builds
+green: cargo test 3/3 pass; release rebuilt (20.8MB @14:32) and RUNNING
+(PID ~107662).
+
+NOT YET VERIFIED BY USER:
+- drag-drop feel/edge cases (drag from empty area, drop back onto source)
+- tab reorder while dual-pane
+- netshare smbclient browser round-trip
+
+LEFT ON LIST (unchanged): archive walk-in VFS, tags v2 filters+rename-follow,
+SMB write ops in browse dialog, content grep in search, column width
+persistence, accessibility pass, clippy cleanup, Windows/macOS builds via
+docs/PROMPT-*.md on those machines.
+
+SESSION 15 - trackers bar, settings buttons, zip VFS, smb write ops
+---------------------------------------------------------------------
+- TRACKER BAR FIX: AudioPlayer.rendering flag; finished() returns false
+  while module renders -> Pause/Stop/volume bar stays visible with
+  "loading module..." hint until sink attaches.
+- SETTINGS: Apply/OK confirmed present in code (user saw stale binary);
+  OK closes via local flag (borrow-safe).
+- ZIP WALK-IN VFS: virtual paths "<file.zip>!<inner/path>". list_dir
+  detects pattern and synthesizes dir/file entries from central directory;
+  dbl-click .zip or ctx "Browse archive" enters it; ".." walks out
+  naturally; opening inner file extracts to ~/.cache/hyperdrive/zip then
+  opens via default app. Read-only by design. zip crate pinned =0.6.6.
+- SMB WRITE OPS in browse dialog: MkDir + Delete (rmdir/del) via
+  smbclient -N; row single-click selects, dbl-click descends.
+- All tests pass; release rebuilt & RUNNING (PID ~116523).
+
+LEFT: tags v2 sidebar filters+rename-follow; content grep; column width
+persistence; accessibility/clippy sweeps; platform builds on user machines.
+
+SESSION 15b - preview panel diagnosis (queued for tomorrow)
+-------------------------------------------------------------
+USER: selecting jpg shows no picture panel.
+FOUND: config show_preview=1 ok; real issue = panel silently skipped while
+thumb decode pending/failed, and required exact image match. Patched:
+panel now ALWAYS appears for any single selection - images show texture
+when ready ("loading" gap), other files get placeholder info card; text
+files keep monospace view. Needs visual verification next session.
+TOMORROW LIST: verify preview on real jpgs; tags v2 sidebar filters +
+rename-follow; content grep; column width persistence; accessibility/
+clippy sweeps; archive write ops? ; platform builds via prompts.
+
+SESSION 16 - tags v2, content grep, preview fix, clippy
+--------------------------------------------------------
+- TAGS V2: color filter sidebar in tree (Bookmarks/Devices/Network/Tags
+  sections). Click color to filter, click "(none)" to clear. Tags follow
+  renames (tagstore.rename called in rename_selected). Context menu Tag
+  submenu uses RowAction::Tag -> apply_row_actions handler.
+- CONTENT GREP: checkbox in Ctrl+F search dialog. When checked, reads
+  text files <1MB (skips binaries via null-byte check) and matches
+  needle in content. Extends filename-only search.
+- PREVIEW PANEL FIX: removed .min(1.0) cap on scale — images now stretch
+  to fill the 300px preview panel width instead of staying at native size.
+- COLUMN WIDTH PERSISTENCE: col_date_w setting (default 138px, range
+  40-300) saved to config, used in Pane::draw via parameter.
+- CLIPPY: fixed f32/f64 fallback warnings (will be hard error), unused
+  imports, unused vars, unnecessary parens. Warnings 44->24.
+- CLEANED: duplicate "Browse archive" ctx menu entries removed.
+- All tests pass (3/3). Release + AppImage built.
+
+LEFT: verify tags sidebar visually; verify content grep on real files;
+platform builds via prompt docs.
