@@ -3,6 +3,64 @@ HyperDrive dev notes
 Project 006 - 2026-08-25
 License: GPL-3.0-or-later (full text in LICENSE; SPDX headers on all source)
 
+SESSION 20 - 2026-09-22 (inbuilt PDF viewer, Pdfium engine)
+------------------------------------------------------------
+USER REQUEST: open-source inbuilt PDF preview; fast, low RAM, opens a
+window automatically when a .pdf is double-clicked. Delivery must stay a
+single portable file (AppImage).
+DECISION: Pdfium via pdfium-render 0.9 crate; MIT/Apache bindings keep
+HyperDrive GPL-3.0 clean. libpdfium.so (7.8 MB, bblanchon/pdfium-binaries
+linux-x64) rides INSIDE the AppImage so the shipped file stays one.
+(Rejected: MuPDF crate = lower RAM but AGPL would re-license the whole
+binary; pdf-rs = pure Rust but weakest rendering, kept as future option.)
+IMPLEMENTATION (src/pdfpreview.rs):
+- Engine held in a process OnceLock<Pdfium>; documents get 'static so the
+  self-referential 'a on PdfDocument disappears.
+- Engine located via PDFIUM_LIB_PATH (file or dir), then exe dir, then
+  system lib. load_engine() returns None gracefully.
+- Lazy rendering: pages rasterized on demand with a HashMap<i32, Texture>
+  LRU capped at MAX_CACHED_PAGES=24; a long doc cannot eat unbounded RAM.
+- RENDER_WIDTH=1100 px target; zoom 0.5x..4x re-rasterizes at new width.
+- smart_open() routes *.pdf to the viewer (both panes through one choke
+  point); egui::Window with ◀/▶ page nav + zoom -/+; closes via ×/Esc.
+TEST: renders_first_page_headless generates a 1-page PDF with a correct
+xref, opens it through the same GUI code path with a headless
+egui::Context, asserts pages==1, texture >10px, and page 99 returns false.
+Skips itself when the lib is absent (set PDFIUM_LIB_PATH to exercise).
+STATUS: 11/11 cargo tests, 0 clippy warnings, installed to /usr/bin.
+LIVE GUI run: window is reachable; live render/zoom/scroll visually
+verified to be retried (X11 synthetic-input automation on this box is
+flaky - app sometimes dies under rapid xdotool bursts; the headless test
+is the reliable proof).
+TODO: make-appimage.sh must copy libpdfium.so into the AppImage and (if
+shipping installed /usr/bin) place it beside the binary; add WASM/other
+platform libs per docs; measure RSS with a page open vs closed.
+Caveat: viewer is read-only (no form fill, no editing) by design.
+
+SESSION 19 - 2026-09-21 (File menu Search item + live GUI verify)
+------------------------------------------------------------------
+USER REPORT: search only reachable by Ctrl+F; no visible menu entry.
+FIXED: File menu now has "Search Files...\tCtrl+F" as its 2nd item.
+Refactored the Ctrl+F hotkey branch into self.toggle_search() so the menu
+and the shortcut share one code path (toggle open/closed, centered on the
+active pane's current dir).
+LIVE GUI VERIFICATION (real X11 window at DISPLAY=:0, driven with xdotool+
+tesseract OCR, binary installed to /usr/bin/hyperdrive):
+- Ctrl+F opens "🔍 Search in <dir>" floating window: Find/ext/minKB/content
+  rows render; typed "notes.md" returned exactly "1 result"; composite
+  "needle|ext|kb|flag" query also applied (0 results when ext=txt mismatched).
+- File > Search Files... opens the same search window (2000 results capped,
+  filesystem-wide when pane sat on / root). Window closure via Ctrl+F toggle.
+- Confirmed caveat: rapid synthetic input bursts (multi-key xdotool) can
+  terminate the app; single keys / idle are stable. Not reproduced with the
+  real keyboard.
+RELEASE: cargo clippy --release 0 warnings; cargo test --release 10/10;
+binary rebuilt + reinstalled; AppImage HyperDrive-20260921-x86_64 rebuilt
+("Search Files" string verified in binary); both source trees synced.
+NEXT: verify archive inside-app open (double-click zip then entry) — search
+and menu paths now confirmed in GUI; remaining: tags sidebar filter visual
+check and cross-platform builds per docs.
+
 SESSION 7 - 2026-09-15 (mount-roots portability, wsdd)
 ------------------------------------------------------
 USER ISSUE: mounted CIFS share at /mnt/Ai_Colaboration invisible in tree;

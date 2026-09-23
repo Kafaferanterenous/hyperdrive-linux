@@ -10,6 +10,7 @@ mod audio;
 mod browser;
 mod config;
 mod theme;
+mod pdfpreview;
 
 use eframe::egui;
 

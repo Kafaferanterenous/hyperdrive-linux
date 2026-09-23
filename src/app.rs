@@ -982,6 +982,7 @@ pub struct HyperDriveApp {
     pub thumbs: crate::thumbs::ThumbStore,
     pub thumb_tex: std::collections::HashMap<PathBuf, egui::TextureHandle>,
     pub previews: crate::thumbs::ThumbStore,
+    pub pdf_preview: crate::pdfpreview::PdfPreview,
     pub jobman: crate::jobs::JobManager,
     pub show_jobs: bool,
     pub tagstore: crate::tags::TagStore,
@@ -1119,6 +1120,7 @@ impl HyperDriveApp {
             thumbs: crate::thumbs::ThumbStore::new(),
             thumb_tex: std::collections::HashMap::new(),
             previews: crate::thumbs::ThumbStore::with_size(360),
+            pdf_preview: crate::pdfpreview::PdfPreview::new(),
             preview_tex: None,
             jobman: crate::jobs::JobManager::new(),
             show_jobs: true,
@@ -1733,6 +1735,12 @@ impl HyperDriveApp {
             self.dialog = Dialog::NewFolder("New folder".into());
             ui.close_menu();
         }
+        ui.separator();
+        if ui.button("Search Files...\tCtrl+F").clicked() {
+            self.toggle_search();
+            ui.close_menu();
+        }
+        ui.separator();
         let has_sel = !self.panes[self.settings.active_pane.min(1)].selected.is_empty();
         if ui.add_enabled(has_sel, egui::Button::new("Rename...\tF2")).clicked() {
             let p = &self.panes[self.settings.active_pane.min(1)];
@@ -2555,6 +2563,16 @@ impl HyperDriveApp {
 
 impl HyperDriveApp {
     // ========================= KEYBOARD SHORTCUTS =========================
+    fn toggle_search(&mut self) {
+        let idx = self.settings.active_pane.min(1);
+        if self.search.is_none() {
+            let dir = self.panes[idx].history.current.clone();
+            self.search = Some(crate::app_search::SearchState::new(dir));
+        } else {
+            self.search = None;
+        }
+    }
+
     fn handle_hotkeys(&mut self, ctx: &egui::Context) {
         use egui::Key::*;
         let wants = ctx.memory(|m| m.focused().is_some());
@@ -2605,14 +2623,7 @@ impl HyperDriveApp {
                     .map(|e| e.name.clone()).collect();
             }
             if i.modifiers.ctrl && i.key_pressed(L) { self.focus_path_req = true; }
-            if i.modifiers.ctrl && i.key_pressed(F) {
-                if self.search.is_none() {
-                    let dir = self.panes[idx].history.current.clone();
-                    self.search = Some(crate::app_search::SearchState::new(dir));
-                } else {
-                    self.search = None;
-                }
-            }
+            if i.modifiers.ctrl && i.key_pressed(F) { self.toggle_search(); }
             if i.modifiers.alt && i.key_pressed(Enter) { open_props = true; }
             // Enter opens first selection
             if i.key_pressed(Enter) && !self.selected_names_empty(idx) {
@@ -3214,6 +3225,109 @@ impl HyperDriveApp {
             self.active_pane().navigate(p);
         }
     }
+
+    fn draw_pdf(&mut self, ctx: &egui::Context) {
+        if self.pdf_preview.path.is_none() {
+            return;
+        }
+        let mut open = true;
+        let mut page_req = self.pdf_preview.page;
+        let mut zoom_int = self.pdf_preview.zoom;
+
+        let title = self
+            .pdf_preview
+            .path
+            .as_ref()
+            .map(|p| {
+                format!(
+                    "{} - {}",
+                    p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default(),
+                    p.display()
+                )
+            })
+            .unwrap_or_default();
+
+        egui::Window::new(title)
+            .open(&mut open)
+            .default_width(880.0)
+            .default_height(640.0)
+            .show(ctx, |ui| {
+                let zoom_now = zoom_int;
+                if let Some(err) = &self.pdf_preview.error {
+                    ui.colored_label(ui.visuals().error_fg_color, err);
+                } else if self.pdf_preview.pages > 0 {
+                    ui.horizontal(|ui| {
+                        let prev = ui.add_enabled(
+                            self.pdf_preview.page > 0,
+                            egui::Button::new("◀"),
+                        );
+                        if prev.clicked() {
+                            page_req = self.pdf_preview.page.saturating_sub(1);
+                        }
+                        ui.label(format!("{}/{}", self.pdf_preview.page + 1, self.pdf_preview.pages));
+                        let next = ui.add_enabled(
+                            self.pdf_preview.page + 1 < self.pdf_preview.pages,
+                            egui::Button::new("▶"),
+                        );
+                        if next.clicked() {
+                            page_req = (self.pdf_preview.page + 1).min(self.pdf_preview.pages - 1);
+                        }
+                        ui.separator();
+                        ui.label("zoom:");
+                        if ui.button("−").clicked() {
+                            zoom_int = (zoom_now - 0.25).max(0.5);
+                        }
+                        ui.add(egui::DragValue::new(&mut zoom_int).speed(0.05));
+                        if ui.button("+").clicked() {
+                            zoom_int = (zoom_now + 0.25).min(4.0);
+                        }
+                        ui.label(format!("{}%", (zoom_now * 100.0) as i32));
+                        ui.separator();
+                        ui.label(format!(
+                            "{} pages · loaded on demand",
+                            self.pdf_preview.pages
+                        ));
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for i in 0..self.pdf_preview.pages {
+                                let avail_w = ui.available_width().min(900.0);
+                                if !self.pdf_preview.ensure_page(ctx, i) {
+                                    ui.small(format!("page {}: could not render", i + 1));
+                                    continue;
+                                }
+                                let Some(size) = self.pdf_preview.cached_size(i) else {
+                                    continue;
+                                };
+                                let Some(tex) = self.pdf_preview.cached_texture(i) else {
+                                    continue;
+                                };
+                                let mut size = size;
+                                // Clamp to the window width, keep aspect ratio.
+                                if size.x > avail_w {
+                                    size *= avail_w / size.x;
+                                }
+                                ui.add_sized(
+                                    size,
+                                    egui::Image::new(egui::load::SizedTexture::new(tex.id(), size)),
+                                );
+                            }
+                        });
+                } else if self.pdf_preview.path.is_some() {
+                    ui.spinner();
+                    ui.small("opening…");
+                }
+            });
+
+        if !open {
+            self.pdf_preview.close();
+        } else {
+            self.pdf_preview.page = page_req.max(0).min((self.pdf_preview.pages - 1).max(0));
+            self.pdf_preview.zoom = zoom_int.clamp(0.5, 4.0);
+        }
+    }
 }
 
 impl eframe::App for HyperDriveApp {
@@ -3254,6 +3368,7 @@ impl eframe::App for HyperDriveApp {
         }
         self.draw_dialog(ctx);
         self.draw_search(ctx);
+        self.draw_pdf(ctx);
         if self.settings.dual_pane {
             self.right_pane_panel(ctx);
         }
@@ -3488,6 +3603,12 @@ impl HyperDriveApp {
             .unwrap_or_default();
         if is_audio_file(&path.display().to_string()) && !self.settings.openwith.iter().any(|(e, _)| e == &ext) {
             let _ = self.audio.play(path);
+            return;
+        }
+        if ext == ".pdf" {
+            // Inbuilt viewer: render into a floating window instead of
+            // launching an external program.
+            self.pdf_preview.open(path);
             return;
         }
         if let Some((_, dp)) = self.settings.openwith.iter().find(|(e, _)| *e == ext) {

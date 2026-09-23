@@ -12,6 +12,15 @@ LDEPLOY=packaging/linuxdeploy-x86_64.AppImage
 
 mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/256x256/apps"
 cp "$BIN" "$APPDIR/usr/bin/hyperdrive"
+# Bundle the Pdfium engine for the inbuilt PDF viewer beside the binary so
+# the AppImage stays one self-contained file.
+PDFIUM_SRC="${PDFIUM_SRC:-/usr/bin/libpdfium.so}"
+if [ -f "$PDFIUM_SRC" ]; then
+  cp "$PDFIUM_SRC" "$APPDIR/usr/bin/libpdfium.so"
+  echo "bundled libpdfium.so from $PDFIUM_SRC"
+else
+  echo "WARNING: $PDFIUM_SRC not found; PDF viewer will be unavailable" >&2
+fi
 cp packaging/hyperdrive.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/hyperdrive.png"
 cat > "$APPDIR/usr/share/applications/hyperdrive.desktop" << DESKTOP
 [Desktop Entry]
