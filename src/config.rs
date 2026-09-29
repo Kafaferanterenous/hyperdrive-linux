@@ -64,6 +64,7 @@ pub struct Settings {
     pub grid_view: bool,
     pub tag_filter: Option<String>,
     pub col_date_w: f32,
+    pub show_toolbar: bool,
 }
 
 impl Default for Settings {
@@ -89,6 +90,7 @@ impl Default for Settings {
             col_date_w: 138.0,
             recents: Vec::new(),
             sync_browse: false,
+            show_toolbar: true,
         }
     }
 }
@@ -149,6 +151,7 @@ impl Settings {
                         "show_hidden" => s.show_hidden = v.trim() == "1",
                         "show_preview" => s.show_preview = v.trim() == "1",
                         "grid_view" => s.grid_view = v.trim() == "1",
+                        "show_toolbar" => s.show_toolbar = v.trim() == "1",
                         "sync_browse" => s.sync_browse = v.trim() == "1",
                         "recents" => {
                             s.recents = v.split(';').filter(|x| !x.is_empty())
@@ -205,7 +208,7 @@ impl Settings {
             let _ = fs::create_dir_all(parent);
         }
         let body = format!(
-            "theme={}\nfont_size={:.1}\nfont_family={}\nshow_tree={}\ndual_pane={}\nactive_pane={}\naudio_one_click={}\nshow_hidden={}\nshow_preview={}\ngrid_view={}\nsync_browse={}\nrecents={}\nbookmarks={}\nnet_locations={}\npane0_path={}\npane1_path={}\nside0_tabs={}\nside1_tabs={}\npane0_sort={}\npane1_sort={}\nopenwith={}\ncol_date_w={:.1}\n",
+            "theme={}\nfont_size={:.1}\nfont_family={}\nshow_tree={}\ndual_pane={}\nactive_pane={}\naudio_one_click={}\nshow_hidden={}\nshow_preview={}\ngrid_view={}\nsync_browse={}\nrecents={}\nbookmarks={}\nnet_locations={}\npane0_path={}\npane1_path={}\nside0_tabs={}\nside1_tabs={}\npane0_sort={}\npane1_sort={}\nopenwith={}\ncol_date_w={:.1}\nshow_toolbar={}\n",
             self.theme.label(),
             self.font_size,
             self.font_family,
@@ -228,6 +231,7 @@ impl Settings {
             format_args!("{} {}", self.pane_sort[1].0, if self.pane_sort[1].1 {1} else {0}),
             self.openwith.iter().map(|(a,b)| format!("{a}|{b}")).collect::<Vec<_>>().join(";"),
             self.col_date_w,
+            if self.show_toolbar { 1 } else { 0 },
         );
         // Try portable location first, fall back to user config dir.
         if fs::write(&path, &body).is_ok() {

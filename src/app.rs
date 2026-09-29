@@ -94,6 +94,7 @@ pub struct Pane {
     pub open_in_new_tab: Option<PathBuf>,
     pub open_req: Option<PathBuf>,
     pub listing_rx: Option<std::sync::mpsc::Receiver<Result<Vec<Entry>, String>>>,
+    pub listing_pending_initial: bool,
     pub rubber: Option<(egui::Pos2, egui::Pos2)>,
     pub rubber_sel: std::collections::HashSet<String>,
     pub row_rects: Vec<egui::Rect>,
@@ -125,6 +126,7 @@ impl Pane {
             open_in_new_tab: None,
             open_req: None,
             listing_rx: None,
+            listing_pending_initial: true,
             rubber: None,
             rubber_sel: Default::default(),
             row_rects: Vec::new(),
@@ -162,17 +164,20 @@ impl Pane {
                 self.apply_sort();
                 self.last_error = None;
                 self.listing_rx = None;
+                self.listing_pending_initial = false;
                 true
             }
             Ok(Err(e)) => {
                 self.last_error = Some(e);
                 self.err_ttl = 480;
                 self.listing_rx = None;
+                self.listing_pending_initial = false;
                 true
             }
             Err(TryRecvError::Empty) => false,
             Err(TryRecvError::Disconnected) => {
                 self.listing_rx = None;
+                self.listing_pending_initial = false;
                 true
             }
         }
@@ -711,6 +716,8 @@ impl Pane {
                         self.selected.clear();
                         self.selected.insert(name.clone());
                     }
+                    if resp.secondary_clicked() || resp.clicked() {
+                    }
                     resp.context_menu(|ui| {
                         let sel_any = !self.selected.is_empty();
                         let w = egui::vec2(160.0, 0.0);
@@ -817,10 +824,16 @@ impl Pane {
         );
         self.pane_list_rect = Some(list_rect);
         let ptr = ui.input(|i| i.pointer.clone());
-        // Start rubber-band ONLY on presses that did not land on a row.
+        // Start rubber-band ONLY on presses that did not land on a row
+        // and are not over an open menu/dialog above this pane.
         if self.rubber.is_none() && ptr.primary_pressed() {
             if let Some(p0) = ptr.interact_pos() {
-                if list_rect.contains(p0)
+                let over_overlay = ui.ctx()
+                    .layer_id_at(p0)
+                    .map(|l| l.order != egui::Order::Background)
+                    .unwrap_or(false);
+                if !over_overlay
+                    && list_rect.contains(p0)
                     && !self.row_rects.iter().any(|r| r.contains(p0))
                 {
                     self.rubber = Some((p0, p0));
@@ -985,6 +998,8 @@ pub struct HyperDriveApp {
     pub pdf_preview: crate::pdfpreview::PdfPreview,
     pub jobman: crate::jobs::JobManager,
     pub show_jobs: bool,
+    /// delete-job labels already handled (auto-reload fired), reset when jobs window empties
+    pub jobs_done_seen: std::collections::HashSet<String>,
     pub tagstore: crate::tags::TagStore,
     pub tag_cache: std::collections::HashMap<PathBuf, String>,
     pub preview_tex: Option<(PathBuf, egui::TextureHandle)>,
@@ -1124,6 +1139,7 @@ impl HyperDriveApp {
             preview_tex: None,
             jobman: crate::jobs::JobManager::new(),
             show_jobs: true,
+            jobs_done_seen: std::collections::HashSet::new(),
             tagstore: crate::tags::TagStore::open(),
             tag_cache: Default::default(),
         };
@@ -1779,7 +1795,7 @@ impl HyperDriveApp {
         {
             let names = selected_paths(&self.panes[self.settings.active_pane.min(1)])
                 .iter().map(|p| p.display().to_string()).collect();
-            self.dialog = Dialog::ConfirmDelete { names };
+            self.confirm_or_delete(names);
             ui.close_menu();
         }
         ui.separator();
@@ -1867,6 +1883,9 @@ impl HyperDriveApp {
 
     fn menu_view(&mut self, ui: &mut egui::Ui) {
         if ui.checkbox(&mut self.settings.show_tree, "Folder tree panel").changed() {
+            let _ = self.settings.save();
+        }
+        if ui.checkbox(&mut self.settings.show_toolbar, "Toolbar").changed() {
             let _ = self.settings.save();
         }
         if ui.checkbox(&mut self.settings.grid_view, "Icon / grid view").changed() {
@@ -2271,6 +2290,8 @@ impl HyperDriveApp {
                     let paths: Vec<PathBuf> = names.iter().map(PathBuf::from).collect();
                     self.delete_permanent(paths);
                     self.dialog = Dialog::None;
+                } else if open {
+                    self.dialog = Dialog::ConfirmDelete { names };
                 }
             }
             Dialog::SftpConnect { mut server, mut user } => {
@@ -2590,10 +2611,10 @@ impl HyperDriveApp {
                 }
             }
             if i.key_pressed(Delete) {
-                if i.modifiers.shift { 
+if i.modifiers.shift { 
                     let names = selected_paths(&self.panes[idx])
                         .iter().map(|p| p.display().to_string()).collect();
-                    self.dialog = Dialog::ConfirmDelete { names };
+                    self.confirm_or_delete(names);
                 } else {
                     self.trash_selected();
                 }
@@ -2788,12 +2809,12 @@ impl HyperDriveApp {
             }
             Symlink => self.symlink_first(),
             Trash => self.trash_selected(),
-            DeletePermanent => {
-                let names = selected_paths(&self.panes[idx])
+DeletePermanent => {
+                let names: Vec<String> = selected_paths(&self.panes[idx])
                     .iter()
                     .map(|p| p.display().to_string())
                     .collect();
-                self.dialog = Dialog::ConfirmDelete { names };
+                self.confirm_or_delete(names);
             }
             Props => self.open_properties(),
             Extract(arch) => {
@@ -2851,7 +2872,22 @@ impl HyperDriveApp {
 
     fn delete_permanent(&mut self, paths: Vec<PathBuf>) {
         self.jobman.enqueue_delete(paths);
-        self.show_jobs = true;
+    }
+
+    /// Confirm only when the selection contains a non-empty directory;
+    /// plain files (and empty folders) are deleted without a dialog.
+    fn confirm_or_delete(&mut self, names: Vec<String>) {
+        let needs_confirm = names.iter().any(|n| {
+            std::fs::read_dir(n)
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false)
+        });
+        if needs_confirm {
+            self.dialog = Dialog::ConfirmDelete { names };
+        } else {
+            let paths: Vec<PathBuf> = names.iter().map(PathBuf::from).collect();
+            self.delete_permanent(paths);
+        }
     }
 
     fn symlink_first(&mut self) {
@@ -3029,6 +3065,31 @@ impl HyperDriveApp {
     }
 
     // ============================ JOBS WINDOW ============================
+    /// Reload panes once a Delete job completes, even while the Operations
+    /// window is hidden. Keeps deleted rows from lingering in the listing.
+    fn reload_after_deletes(&mut self) {
+        self.jobman.prune_finished();
+        let snap = self.jobman.snapshot();
+        if snap.is_empty() {
+            self.jobs_done_seen.clear();
+            return;
+        }
+        let mut need_reload = false;
+        for jarc in &snap {
+            let Ok(j) = jarc.lock() else { continue };
+            if j.state == crate::jobs::JobState::Done
+                && self.jobs_done_seen.insert(j.label.clone())
+                && j.label.starts_with("Delete")
+            {
+                need_reload = true;
+            }
+        }
+        if need_reload {
+            self.panes[0].reload();
+            self.panes[1].reload();
+        }
+    }
+
     fn draw_jobs(&mut self, ctx: &egui::Context) {
         if !self.show_jobs { return; }
         self.jobman.prune_finished();
@@ -3036,7 +3097,7 @@ impl HyperDriveApp {
         if snap.is_empty() { self.show_jobs = false; return; }
 
         let mut any_running = false;
-        egui::Window::new("\u{1F4E6} Operations")
+        egui::Window::new("\u{1F4E6} Operations".to_owned())
             .open(&mut self.show_jobs)
             .default_width(420.0)
             .anchor(egui::Align2::RIGHT_BOTTOM, [-8.0, -30.0])
@@ -3231,6 +3292,7 @@ impl HyperDriveApp {
             return;
         }
         let mut open = true;
+        let mut close_clicked = false;
         let mut page_req = self.pdf_preview.page;
         let mut zoom_int = self.pdf_preview.zoom;
 
@@ -3247,15 +3309,48 @@ impl HyperDriveApp {
             })
             .unwrap_or_default();
 
-        egui::Window::new(title)
+        egui::Window::new(title.clone())
+            .title_bar(false)
             .open(&mut open)
             .default_width(880.0)
             .default_height(640.0)
             .show(ctx, |ui| {
                 let zoom_now = zoom_int;
+                let gap = 12.0_f32;
                 if let Some(err) = &self.pdf_preview.error {
                     ui.colored_label(ui.visuals().error_fg_color, err);
                 } else if self.pdf_preview.pages > 0 {
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(0x27, 0x2D, 0x38))
+                        .rounding(egui::Rounding::same(6.0))
+                        .inner_margin(egui::Margin::symmetric(10.0, 6.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new(title.clone())
+                                        .strong()
+                                        .color(egui::Color32::from_rgb(0xE8, 0xEC, 0xF2)),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .add(
+                                                egui::Button::new(
+                                                    egui::RichText::new("\u{2715}").size(16.0).strong().color(egui::Color32::WHITE),
+                                                )
+                                                .fill(egui::Color32::from_rgb(0xB0, 0x30, 0x30))
+                                                .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(0xFF, 0xFF, 0xFF))),
+                                            )
+                                            .clicked()
+                                        {
+                                            close_clicked = true;
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                    ui.separator();
                     ui.horizontal(|ui| {
                         let prev = ui.add_enabled(
                             self.pdf_preview.page > 0,
@@ -3276,10 +3371,49 @@ impl HyperDriveApp {
                         ui.label("zoom:");
                         if ui.button("−").clicked() {
                             zoom_int = (zoom_now - 0.25).max(0.5);
+                            self.pdf_preview.fit = crate::pdfpreview::FitMode::Manual;
                         }
-                        ui.add(egui::DragValue::new(&mut zoom_int).speed(0.05));
+                        let zoom_dragged = ui.add(egui::DragValue::new(&mut zoom_int).speed(0.05)).changed();
+                        if zoom_dragged {
+                            self.pdf_preview.fit = crate::pdfpreview::FitMode::Manual;
+                        }
                         if ui.button("+").clicked() {
                             zoom_int = (zoom_now + 0.25).min(4.0);
+                            self.pdf_preview.fit = crate::pdfpreview::FitMode::Manual;
+                        }
+                        let spread = self.pdf_preview.spread;
+                        if ui.button("Fit width").clicked() {
+                            let (aw, _) = self.pdf_preview.fit_avail;
+                            zoom_int = if spread {
+                                (aw - gap) / (2.0 * crate::pdfpreview::RENDER_WIDTH)
+                            } else {
+                                aw / crate::pdfpreview::RENDER_WIDTH
+                            };
+                            zoom_int = zoom_int.clamp(0.2, 4.0);
+                            self.pdf_preview.fit = crate::pdfpreview::FitMode::Width;
+                        }
+                        if ui.button("Fit page").clicked() {
+                            let (aw, ah) = self.pdf_preview.fit_avail;
+                            let aspect = self.pdf_preview.page_aspect(self.pdf_preview.page);
+                            let fit = if spread {
+                                (aw - gap) / (2.0 * crate::pdfpreview::RENDER_WIDTH)
+                            } else {
+                                aw / crate::pdfpreview::RENDER_WIDTH
+                            };
+                            zoom_int = fit.min(ah * aspect / crate::pdfpreview::RENDER_WIDTH).clamp(0.2, 4.0);
+                            self.pdf_preview.fit = crate::pdfpreview::FitMode::Page;
+                        }
+                        if ui.selectable_label(spread, "Two pages").clicked() {
+                            self.pdf_preview.spread = !spread;
+                            let (aw, ah) = self.pdf_preview.fit_avail;
+                            let aspect = self.pdf_preview.page_aspect(self.pdf_preview.page);
+                            let fit = if !self.pdf_preview.spread {
+                                aw / crate::pdfpreview::RENDER_WIDTH
+                            } else {
+                                (aw - gap) / (2.0 * crate::pdfpreview::RENDER_WIDTH)
+                            };
+                            zoom_int = fit.min(ah * aspect / crate::pdfpreview::RENDER_WIDTH).clamp(0.2, 4.0);
+                            self.pdf_preview.fit = crate::pdfpreview::FitMode::Page;
                         }
                         ui.label(format!("{}%", (zoom_now * 100.0) as i32));
                         ui.separator();
@@ -3289,30 +3423,82 @@ impl HyperDriveApp {
                         ));
                     });
                     ui.separator();
+                    let avail_w_vp = ui.available_width().min(900.0);
+                    let avail_h_vp = ui.available_height().max(80.0);
+                    self.pdf_preview.fit_avail = (avail_w_vp, avail_h_vp);
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
-                            for i in 0..self.pdf_preview.pages {
-                                let avail_w = ui.available_width().min(900.0);
-                                if !self.pdf_preview.ensure_page(ctx, i) {
-                                    ui.small(format!("page {}: could not render", i + 1));
-                                    continue;
-                                }
-                                let Some(size) = self.pdf_preview.cached_size(i) else {
-                                    continue;
+                            let inner_w = avail_w_vp;
+                            let mut i = 0;
+                            while i < self.pdf_preview.pages {
+                                let cnt = if self.pdf_preview.spread && i + 1 < self.pdf_preview.pages {
+                                    2_i32
+                                } else {
+                                    1_i32
                                 };
-                                let Some(tex) = self.pdf_preview.cached_texture(i) else {
-                                    continue;
-                                };
-                                let mut size = size;
-                                // Clamp to the window width, keep aspect ratio.
-                                if size.x > avail_w {
-                                    size *= avail_w / size.x;
+                                let mut rows: Vec<Option<(egui::TextureId, egui::Vec2)>> = Vec::with_capacity(cnt as usize);
+                                for k in 0..cnt {
+                                    let idx = i + k;
+                                    if !self.pdf_preview.ensure_page(ctx, idx) {
+                                        rows.push(None);
+                                        continue;
+                                    }
+                                    let Some(size) = self.pdf_preview.cached_size(idx) else {
+                                        rows.push(None);
+                                        continue;
+                                    };
+                                    let Some(tex) = self.pdf_preview.cached_texture(idx) else {
+                                        rows.push(None);
+                                        continue;
+                                    };
+                                    let hor = if self.pdf_preview.spread {
+                                        (inner_w - gap) / 2.0
+                                    } else {
+                                        inner_w
+                                    };
+                                    let mut disp = size;
+                                    match self.pdf_preview.fit {
+                                        crate::pdfpreview::FitMode::Page => {
+                                            let s = (hor / disp.x).min(avail_h_vp / disp.y.max(1.0));
+                                            if (s - 1.0).abs() > 0.001 {
+                                                disp *= s;
+                                            }
+                                        }
+                                        _ => {
+                                            if disp.x > hor {
+                                                disp *= hor / disp.x;
+                                            }
+                                        }
+                                    }
+                                    rows.push(Some((tex.id(), disp)));
                                 }
-                                ui.add_sized(
-                                    size,
-                                    egui::Image::new(egui::load::SizedTexture::new(tex.id(), size)),
-                                );
+                                let pair_w: f32 = rows
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(k, r)| {
+                                        r.map_or(0.0, |(_, s)| s.x)
+                                            + if k == 1 { gap } else { 0.0 }
+                                    })
+                                    .sum();
+                                let pad = ((inner_w - pair_w).max(0.0)) / 2.0;
+                                ui.horizontal(|ui| {
+                                    ui.add_space(pad);
+                                    for (k, r) in rows.iter().enumerate() {
+                                        if let Some((tid, disp)) = r {
+                                            if k == 1 {
+                                                ui.add_space(gap);
+                                            }
+                                            ui.add_sized(
+                                                *disp,
+                                                egui::Image::new(egui::load::SizedTexture::new(*tid, *disp)),
+                                            );
+                                        } else {
+                                            ui.small(format!("page {}: could not render", i + k as i32 + 1));
+                                        }
+                                    }
+                                });
+                                i += cnt;
                             }
                         });
                 } else if self.pdf_preview.path.is_some() {
@@ -3321,7 +3507,7 @@ impl HyperDriveApp {
                 }
             });
 
-        if !open {
+        if !open || close_clicked {
             self.pdf_preview.close();
         } else {
             self.pdf_preview.page = page_req.max(0).min((self.pdf_preview.pages - 1).max(0));
@@ -3335,6 +3521,11 @@ impl eframe::App for HyperDriveApp {
         let h = self.settings.show_hidden;
         self.panes[0].show_hidden = h;
         self.panes[1].show_hidden = h;
+        for idx in 0..2 {
+            if self.panes[idx].listing_pending_initial && self.panes[idx].listing_rx.is_none() {
+                self.panes[idx].reload();
+            }
+        }
         if !self.pane_sort_seeded {
             for (i, (k, asc)) in self.settings.pane_sort.iter().enumerate().take(2) {
                 let key = match k { 1 => SortKey::Size, 2 => SortKey::Modified, 3 => SortKey::Created, _ => SortKey::Name };
@@ -3347,9 +3538,12 @@ impl eframe::App for HyperDriveApp {
         self.egui_ctx_for_props = Some(ctx.clone());
         self.handle_hotkeys(ctx);
         self.menu_bar(ctx);
-        self.toolbar(ctx);
+        if self.settings.show_toolbar {
+            self.toolbar(ctx);
+        }
         self.playback_bar(ctx);
         self.statusbar(ctx);
+        self.reload_after_deletes();
         self.draw_jobs(ctx);
         self.audio.poll();
         if let Some(e) = self.audio.last_err.take() {

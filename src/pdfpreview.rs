@@ -19,7 +19,18 @@ use pdfium_render::prelude::*;
 const MAX_CACHED_PAGES: usize = 24;
 
 /// Render width for a single page in logical px (before zoom).
-const RENDER_WIDTH: f32 = 1100.0;
+pub const RENDER_WIDTH: f32 = 1100.0;
+
+/// How pages are sized inside the viewer scroll area.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FitMode {
+    /// Manual ± zoom; pages only downsized when wider than the window.
+    Manual,
+    /// Clamp page width to the window width.
+    Width,
+    /// Fit the whole page inside the window (both dimensions).
+    Page,
+}
 
 /// PdfDocument borrows the Pdfium instance, so the engine lives for the whole
 /// process in a OnceLock and documents get a 'static lifetime.
@@ -68,6 +79,11 @@ pub struct PdfPreview {
     pub page: i32,
     pub pages: i32,
     pub zoom: f32,
+    pub fit: FitMode,
+    /// Two pages side by side when true.
+    pub spread: bool,
+    /// Window viewport (w, h) in egui points, refreshed each frame.
+    pub fit_avail: (f32, f32),
 }
 
 impl Default for PdfPreview {
@@ -87,11 +103,17 @@ impl PdfPreview {
             page: 0,
             pages: 0,
             zoom: 1.0,
+            fit: FitMode::Manual,
+            spread: false,
+            fit_avail: (900.0, 600.0),
         }
     }
 
     pub fn open(&mut self, path: &Path) {
         self.close();
+        self.fit = FitMode::Manual;
+        self.spread = false;
+        self.fit_avail = (900.0, 600.0);
         self.path = Some(path.to_path_buf());
         let Some(engine) = pdfium() else {
             self.error = Some("PDFium library not found".into());
@@ -167,6 +189,19 @@ impl PdfPreview {
     /// Texture handle of a cached page, if already rasterized.
     pub fn cached_texture(&self, index: i32) -> Option<&TextureHandle> {
         self.cache.get(&index)
+    }
+
+    /// Width/height ratio (points) of page `index`; 1.414 fallback.
+    pub fn page_aspect(&self, index: i32) -> f32 {
+        let Some(doc) = self.doc.as_ref() else { return 1.414 };
+        match doc.pages().get(index) {
+            Ok(p) => {
+                let w = p.width().value;
+                let h = p.height().value;
+                if w > 0.0 && h > 0.0 { w / h } else { 1.414 }
+            }
+            Err(_) => 1.414,
+        }
     }
 }
 

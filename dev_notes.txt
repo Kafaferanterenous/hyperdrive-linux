@@ -549,3 +549,34 @@ SESSION 16 - tags v2, content grep, preview fix, clippy
 
 LEFT: verify tags sidebar visually; verify content grep on real files;
 platform builds via prompt docs.
+
+SESSION 17 - PDF viewer polish, permanent-delete fixes
+------------------------------------------------------
+- PDF VIEWER: custom dark title bar (title_bar off, drawer-drawn 0x272D38
+  header with red close X at the right end); two-page spread toggle
+  ("Two pages"); pages horizontally centered in scroll area. Closing
+  fixed via hoisted close_clicked flag (egui 0.27 cannot touch the
+  window's open bool from inside its own closure). Verified live.
+- TOOLBAR HIDE: View -> Toolbar checkbox; show_toolbar config key
+  (default 1) saved/parsed; toolbar draw gated in update(). Verified.
+- DELETE / PERMANENT DELETE (user: "deletes do not work"):
+  * root cause #1 - ConfirmDelete dialog vanished after one frame:
+    draw_dialog consumes self.dialog via mem::replace every frame and the
+    ConfirmDelete arm never re-set it -> dialog flashed. Fixed.
+  * root cause #2 - clicking a context-menu item over the pane started a
+    rubber-band (raw global pointer press) and cleared the selection,
+    so confirm fired on 0 items. Fixed by gating rubber-band start on
+    ctx.layer_id_at(pos) != Background (i.e. not over an open menu/dialog).
+  * auto-reload panes when a Delete job completes (reload_after_deletes)
+    so deleted rows vanish without F5; runs even when Operations hidden.
+  * "Delete Permanently..." no longer opens the Operations popup.
+  * confirm dialog now shows ONLY when the selection contains a
+    non-empty directory; plain files / empty dirs delete immediately
+    (confirm_or_delete). Verified live: plain file deletes w/o dialog;
+    run through context menu path.
+  * jobs.rs new tests: permanent delete removes file+dir; missing path
+    fails cleanly. Suite now 13/13.
+- Tests: 13 passed. Release artifact current; installed /usr/bin.
+
+LEFT: verify dir-confirm dialog visually after VM restart; user GUI
+acceptance run; packaging/docs per accept-criteria.

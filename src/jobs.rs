@@ -215,3 +215,63 @@ fn dir_size_quick(p: &Path) -> Option<u64> {
 }
 
 use std::fs::File;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn wait_done(jm: &JobManager, timeout: Duration) -> Option<bool> {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            let snap = jm.snapshot();
+            for j in &snap {
+                if let Ok(j) = j.lock() {
+                    match j.state {
+                        JobState::Done => return Some(true),
+                        JobState::Failed => return Some(false),
+                        _ => {}
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        None
+    }
+
+    #[test]
+    fn permanent_delete_removes_file_and_dir() {
+        let tmp = std::env::temp_dir().join(format!("hd_deltest_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp.join("sub")).unwrap();
+        std::fs::write(tmp.join("a.txt"), "x").unwrap();
+        std::fs::write(tmp.join("sub/b.txt"), "y").unwrap();
+
+        let jm = JobManager::new();
+        jm.enqueue_delete(vec![
+            tmp.join("a.txt"),
+            tmp.join("sub"),
+        ]);
+
+        let res = wait_done(&jm, Duration::from_secs(10));
+        if res != Some(true) {
+            let snap = jm.snapshot();
+            let errs: Vec<String> = snap.iter().filter_map(|j| j.lock().ok())
+                .filter_map(|j| j.error.clone()).collect();
+            panic!("delete not ok: {:?}; errors={:?}", res, errs);
+        }
+        assert!(!tmp.join("a.txt").exists(), "file still exists");
+        assert!(!tmp.join("sub").exists(), "dir still exists");
+        assert!(std::fs::read_dir(&tmp).map(|mut d| d.next().is_none()).unwrap_or(false),
+            "parent dir not emptied");
+        let _ = std::fs::remove_dir(&tmp);
+    }
+
+    #[test]
+    fn permanent_delete_reports_missing_path_as_failed() {
+        let jm = JobManager::new();
+        jm.enqueue_delete(vec![PathBuf::from("/nonexistent/__hd_no_such__")]);
+        let res = wait_done(&jm, Duration::from_secs(10));
+        assert_eq!(res, Some(false), "missing path should fail the job, not hang");
+    }
+}
