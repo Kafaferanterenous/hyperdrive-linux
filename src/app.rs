@@ -736,6 +736,9 @@ impl Pane {
                         if ui.add_enabled(sel_any, egui::Button::new("Create Symlink").min_size(w)).clicked() {
                             self.action_req = Some(RowAction::Symlink); ui.close_menu();
                         }
+                        if ui.add_enabled(sel_any, egui::Button::new("Send to Desktop").min_size(w)).clicked() {
+                            self.action_req = Some(RowAction::DesktopLink); ui.close_menu();
+                        }
                         if name.to_lowercase().ends_with(".zip")
                             && ui.add_enabled(true, egui::Button::new("Browse archive").min_size(w)).clicked()
                         {
@@ -1020,6 +1023,7 @@ pub enum RowAction {
     Rename,
     Duplicate,
     Symlink,
+    DesktopLink,
     Trash,
     DeletePermanent,
     Props,
@@ -1859,6 +1863,36 @@ impl HyperDriveApp {
                 { if let Err(e) = std::os::unix::fs::symlink(&src, &link) {
                     self.panes[0].last_error = Some(format!("symlink: {e}"));
                     self.panes[0].err_ttl = 480; } }
+                self.active_pane().reload();
+            }
+            ui.close_menu();
+        }
+        if ui.add_enabled(has_sel && cfg!(unix), egui::Button::new("Send to Desktop...")).clicked() {
+            let these: Vec<std::path::PathBuf> = sel_snapshot.clone();
+            let paths = these;
+            if !paths.is_empty() {
+                let desktop = Self::desktop_dir();
+                if std::fs::create_dir_all(&desktop).is_err() && !desktop.is_dir() {
+                    self.panes[0].last_error = Some("desktop folder unavailable (no ~/Desktop)".into());
+                    self.panes[0].err_ttl = 480;
+                } else {
+                    for src in paths {
+                        let base = src.file_name()
+                            .map(|x| x.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "link".into());
+                        let mut name = format!("Link to {base}");
+                        let mut n = 1;
+                        while desktop.join(&name).exists() {
+                            n += 1;
+                            name = format!("Link to {base} ({n})");
+                        }
+                        #[cfg(unix)]
+                        if let Err(e) = std::os::unix::fs::symlink(&src, desktop.join(&name)) {
+                            self.panes[0].last_error = Some(format!("desktop link: {e}"));
+                            self.panes[0].err_ttl = 480;
+                        }
+                    }
+                }
                 self.active_pane().reload();
             }
             ui.close_menu();
@@ -2808,6 +2842,7 @@ if i.modifiers.shift {
                 self.do_duplicates(pairs);
             }
             Symlink => self.symlink_first(),
+            DesktopLink => self.send_to_desktop(),
             Trash => self.trash_selected(),
 DeletePermanent => {
                 let names: Vec<String> = selected_paths(&self.panes[idx])
@@ -2901,6 +2936,51 @@ DeletePermanent => {
                 self.panes[self.settings.active_pane.min(1)].err_ttl = 480; } }
             self.active_pane().reload();
         }
+    }
+
+    /// Where desktop shortcuts live ($XDG_DESKTOP_DIR if set, else ~/Desktop).
+    fn desktop_dir() -> std::path::PathBuf {
+        if let Some(d) = std::env::var_os("XDG_DESKTOP_DIR") {
+            if !d.is_empty() {
+                return std::path::PathBuf::from(d);
+            }
+        }
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join("Desktop")
+    }
+
+    /// Create a symlink to each selected item on the desktop (a desktop shortcut).
+    fn send_to_desktop(&mut self) {
+        let idx = self.settings.active_pane.min(1);
+        let paths = selected_paths(&self.panes[idx]);
+        if paths.is_empty() { return; }
+        let desktop = Self::desktop_dir();
+        if std::fs::create_dir_all(&desktop).is_err() && !desktop.is_dir() {
+            self.panes[idx].last_error = Some("desktop folder unavailable (no ~/Desktop)".into());
+            self.panes[idx].err_ttl = 480;
+            return;
+        }
+        let pane = &mut self.panes[idx];
+        for src in paths {
+            let base = src.file_name()
+                .map(|x| x.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "link".into());
+            let mut name = format!("Link to {base}");
+            let mut n = 1;
+            while desktop.join(&name).exists() {
+                n += 1;
+                name = format!("Link to {base} ({n})");
+            }
+            #[cfg(unix)]
+            if let Err(e) = std::os::unix::fs::symlink(&src, desktop.join(&name)) {
+                pane.last_error = Some(format!("desktop link: {e}"));
+                pane.err_ttl = 480;
+                return;
+            }
+        }
+        self.panes[idx].reload();
     }
 
     /// Copy (cut=false) or move (true) current selection to the other pane's dir.

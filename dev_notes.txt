@@ -580,3 +580,17 @@ SESSION 17 - PDF viewer polish, permanent-delete fixes
 
 LEFT: verify dir-confirm dialog visually after VM restart; user GUI
 acceptance run; packaging/docs per accept-criteria.
+
+SESSION 18 - 2026-09-29 (Send to Desktop; GitHub release v0.6)
+-------------------------------------------------------------
+- GITHUB: source synced to Kafaferanterenous/hyperdrive-linux,
+  commit f64c2e3 pushed (Session 17 changelog); release v0.6-linux-
+  20260929 published with locally built AppImage (SHA-256 in notes).
+- NEW FEATURE (user: "add function so there is ability to make a link
+  on the desktop"): context menu + File menu items "Send to Desktop"
+  / "Send to Desktop..." create a symlink shortcut on the desktop:
+  ~/Desktop/Link to <name> (XDG_DESKTOP_DIR if set, else $HOME/Desktop,
+  auto-created if missing). Collision-proof: appends " (n)".
+  RowAction::DesktopLink; send_to_desktop() helper next to symlink_first().
+  Verified live twice: page4.pdf -> real symlink; repeat run -> " (2)".
+- 13/13 tests pass; release artifact installed to /usr/bin.
