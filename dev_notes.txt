@@ -594,3 +594,25 @@ SESSION 18 - 2026-09-29 (Send to Desktop; GitHub release v0.6)
   RowAction::DesktopLink; send_to_desktop() helper next to symlink_first().
   Verified live twice: page4.pdf -> real symlink; repeat run -> " (2)".
 - 13/13 tests pass; release artifact installed to /usr/bin.
+
+SESSION 19 - 2026-10-07 (built-in ZIP compress + native ZIP/7z extract)
+----------------------------------------------------------------------
+- USER REQUEST: ZIP + 7z compression/decompression built in, no external
+  tools. Delivered:
+  * COMPRESS to ZIP - context menu + File menu "Compress to ZIP..." ->
+    naming dialog (default = selected item's stem, ".zip" appended,
+    refuses to overwrite). JobQueue native ZipWriter, Deflated level 6,
+    recursive folder walk, never nests the archive inside itself.
+  * EXTRACT .zip natively - zip crate; full tree, zip-slip guard (skips
+    ".." paths), overwrite semantics (same as old unzip -o). Operations
+    popup shows job; verified live: "Extract ... page5.zip -> ... done".
+  * EXTRACT .7z natively - sevenz-rust 0.5 (LZMA/LZMA2/BCJ decoder).
+  * tar.* / .tgz still route to system tar (ubiquitous) as before.
+  * external unzip/7z fallbacks removed from the Extract path.
+- jobs.rs new fns: create_zip, extract_zip_all, extract_7z + enqueue_*
+  wrappers. RowAction::CompressZip(Vec<String>), Dialog::CompressZip.
+- New tests: zip_compress_extract_roundtrip, zip_slip_reject, 7z garbage
+  fails cleanly. Suite now 16/16.
+- Verified live on the low-RAM box: select page5.pdf -> Compress to ZIP
+  -> page5.zip valid (entries logged); Extract here -> job done, target
+  restored from the archive. AppImage rebuilt and released.

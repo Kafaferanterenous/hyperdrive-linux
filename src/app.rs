@@ -739,6 +739,10 @@ impl Pane {
                         if ui.add_enabled(sel_any, egui::Button::new("Send to Desktop").min_size(w)).clicked() {
                             self.action_req = Some(RowAction::DesktopLink); ui.close_menu();
                         }
+                        if ui.add_enabled(sel_any, egui::Button::new("Compress to ZIP...").min_size(w)).clicked() {
+                            let names: Vec<String> = self.selected.iter().cloned().collect();
+                            self.action_req = Some(RowAction::CompressZip(names)); ui.close_menu();
+                        }
                         if name.to_lowercase().ends_with(".zip")
                             && ui.add_enabled(true, egui::Button::new("Browse archive").min_size(w)).clicked()
                         {
@@ -1024,6 +1028,7 @@ pub enum RowAction {
     Duplicate,
     Symlink,
     DesktopLink,
+    CompressZip(Vec<String>),
     Trash,
     DeletePermanent,
     Props,
@@ -1035,6 +1040,11 @@ pub enum RowAction {
 pub enum Dialog {
     None,
     NewFolder(String),
+    CompressZip {
+        name: String,
+        sources: Vec<std::path::PathBuf>,
+        dir: std::path::PathBuf,
+    },
     SmbConnect {
         server: String,
         share: String,
@@ -1897,6 +1907,17 @@ impl HyperDriveApp {
             }
             ui.close_menu();
         }
+        if ui.add_enabled(has_sel, egui::Button::new("Compress to ZIP...")).clicked() {
+            let dir = self.panes[self.settings.active_pane.min(1)].history.current.clone();
+            let first = sel_snapshot.first()
+                .map(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+            self.dialog = Dialog::CompressZip {
+                name: first.unwrap_or_else(|| "selection".into()),
+                sources: sel_snapshot.clone(),
+                dir,
+            };
+            ui.close_menu();
+        }
         ui.separator();
         if ui.button("Select All").clicked() {
             let i = self.settings.active_pane.min(1);
@@ -2130,6 +2151,38 @@ impl HyperDriveApp {
                     });
                 });
                 if !open { self.dialog = Dialog::None; } else { self.dialog = Dialog::NewFolder(name); }
+            }
+            Dialog::CompressZip { mut name, sources, dir } => {
+                let mut open = true;
+                egui::Window::new("Compress to ZIP").open(&mut open).resizable(false).show(ctx, |ui| {
+                    ui.label(format!("{} item(s) \u{2192} {}", sources.len(), dir.display()));
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.label("Archive:");
+                        ui.add_sized([240.0, 20.0], egui::TextEdit::singleline(&mut name));
+                        ui.label(".zip");
+                    });
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Create").clicked() {
+                            let mut n = name.trim().to_string();
+                            if n.is_empty() { n = "selection".into(); }
+                            if !n.to_lowercase().ends_with(".zip") { n.push_str(".zip"); }
+                            let dest = dir.join(&n);
+                            if dest.exists() {
+                                self.panes[self.settings.active_pane.min(1)].last_error =
+                                    Some(format!("{n} already exists"));
+                                self.panes[self.settings.active_pane.min(1)].err_ttl = 480;
+                            } else {
+                                self.jobman.enqueue_compress(sources.clone(), dest);
+                                self.show_jobs = true;
+                                self.dialog = Dialog::None;
+                            }
+                        }
+                        if ui.button("Cancel").clicked() { self.dialog = Dialog::None; }
+                    });
+                });
+                if !open { self.dialog = Dialog::None; } else { self.dialog = Dialog::CompressZip { name, sources, dir }; }
             }
             Dialog::Properties { name, path, is_dir, size_s, modified_s, created_s, perms_s, readonly_fs, items } => {
                 let mut open = true;
@@ -2843,6 +2896,17 @@ if i.modifiers.shift {
             }
             Symlink => self.symlink_first(),
             DesktopLink => self.send_to_desktop(),
+            CompressZip(names) => {
+                let dir = self.panes[idx].history.current.clone();
+                let sources: Vec<PathBuf> = names.iter().map(|n| dir.join(n)).collect();
+                let first = names.first()
+                    .map(|n| Path::new(n).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+                self.dialog = Dialog::CompressZip {
+                    name: first.unwrap_or_else(|| "selection".into()),
+                    sources,
+                    dir,
+                };
+            }
             Trash => self.trash_selected(),
 DeletePermanent => {
                 let names: Vec<String> = selected_paths(&self.panes[idx])
@@ -2855,31 +2919,22 @@ DeletePermanent => {
             Extract(arch) => {
                 let dest = arch.parent().unwrap_or(Path::new("/")).to_path_buf();
                 let name = arch.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                use std::process::Command;
-                let cmd: Option<Command> =
-                    if name.to_lowercase().ends_with(".zip") && which_exists("unzip") {
-                        let mut c = Command::new("unzip");
-                        c.arg("-o").arg(&arch).current_dir(&dest);
-                        Some(c)
-                    } else if which_exists("7z") {
-                        let mut c = Command::new("7z");
-                        c.arg("x").arg("-y").arg(format!("-o{}", dest.display())).arg(&arch);
-                        Some(c)
-                    } else if name.contains(".tar.") || name.ends_with(".tgz") {
-                        let mut c = Command::new("tar");
-                        c.arg("-xf").arg(&arch).current_dir(&dest);
-                        Some(c)
-                    } else { None };
-                match cmd {
-                    Some(c) => {
-                        self.jobman.enqueue_extract(arch.clone(), c, dest.display().to_string());
-                        self.show_jobs = true;
-                    }
-                    None => {
-                        self.panes[idx].last_error =
-                            Some("no extractor found (sudo apt install p7zip-full)".into());
-                        self.panes[idx].err_ttl = 480;
-                    }
+                let lower = name.to_lowercase();
+                if lower.ends_with(".zip") {
+                    self.jobman.enqueue_extract_zip(arch, dest);
+                    self.show_jobs = true;
+                } else if lower.ends_with(".7z") {
+                    self.jobman.enqueue_extract_7z(arch, dest);
+                    self.show_jobs = true;
+                } else if (lower.contains(".tar.") || lower.ends_with(".tgz")) && which_exists("tar") {
+                    let mut c = std::process::Command::new("tar");
+                    c.arg("-xf").arg(&arch).current_dir(&dest);
+                    self.jobman.enqueue_extract(arch, c, dest.display().to_string());
+                    self.show_jobs = true;
+                } else {
+                    self.panes[idx].last_error =
+                        Some("built-in extract handles .zip and .7z; tar.* needs system tar".into());
+                    self.panes[idx].err_ttl = 480;
                 }
                 self.panes[idx].reload();
             }

@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use std::io::{Read, Write};
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum JobKind {
     Copy,
@@ -158,6 +160,81 @@ impl JobManager {
         });
     }
 
+    /// Extract a .zip natively via the bundled zip crate (no external tools).
+    pub fn enqueue_extract_zip(&self, archive: PathBuf, dest_dir: PathBuf) {
+        let label = format!("Extract {} \u{2192} {}", archive.display(), dest_dir.display());
+        let done = Arc::new(AtomicU64::new(0));
+        let cancel = Arc::new(AtomicBool::new(true)); // unused; total is counts not bytes
+        let job = Job { label, total: 100, done: done.clone(), cancel, state: JobState::Running, error: None };
+        let arc = self.register(job);
+        self.spawn(move || {
+            match extract_zip_all(&archive, &dest_dir) {
+                Ok(_) => {
+                    if let Ok(mut j) = arc.lock() {
+                        j.done.store(100, Ordering::Relaxed);
+                        j.state = JobState::Done;
+                    }
+                }
+                Err(e) => {
+                    if let Ok(mut j) = arc.lock() {
+                        j.state = JobState::Failed;
+                        j.error = Some(format!("{}: {e}", archive.display()));
+                    }
+                }
+            }
+        });
+    }
+
+    /// Extract a .7z natively via the sevenz-rust decoder (no external tools).
+    pub fn enqueue_extract_7z(&self, archive: PathBuf, dest_dir: PathBuf) {
+        let label = format!("Extract {} \u{2192} {}", archive.display(), dest_dir.display());
+        let done = Arc::new(AtomicU64::new(0));
+        let cancel = Arc::new(AtomicBool::new(true));
+        let job = Job { label, total: 100, done: done.clone(), cancel, state: JobState::Running, error: None };
+        let arc = self.register(job);
+        self.spawn(move || {
+            match extract_7z(&archive, &dest_dir) {
+                Ok(_) => {
+                    if let Ok(mut j) = arc.lock() {
+                        j.done.store(100, Ordering::Relaxed);
+                        j.state = JobState::Done;
+                    }
+                }
+                Err(e) => {
+                    if let Ok(mut j) = arc.lock() {
+                        j.state = JobState::Failed;
+                        j.error = Some(format!("{}: {e}", archive.display()));
+                    }
+                }
+            }
+        });
+    }
+
+    /// Create a .zip from the given sources natively via the bundled zip crate.
+    pub fn enqueue_compress(&self, sources: Vec<PathBuf>, dest_zip: PathBuf) {
+        let label = format!("Compress {} item(s) \u{2192} {}", sources.len(), dest_zip.display());
+        let done = Arc::new(AtomicU64::new(0));
+        let cancel = Arc::new(AtomicBool::new(true));
+        let job = Job { label, total: 100, done: done.clone(), cancel, state: JobState::Running, error: None };
+        let arc = self.register(job);
+        self.spawn(move || {
+            match create_zip(&sources, &dest_zip) {
+                Ok(_) => {
+                    if let Ok(mut j) = arc.lock() {
+                        j.done.store(100, Ordering::Relaxed);
+                        j.state = JobState::Done;
+                    }
+                }
+                Err(e) => {
+                    if let Ok(mut j) = arc.lock() {
+                        j.state = JobState::Failed;
+                        j.error = Some(format!("{}: {e}", dest_zip.display()));
+                    }
+                }
+            }
+        });
+    }
+
     pub fn snapshot(&self) -> Vec<Arc<Mutex<Job>>> {
         self.core.jobs.lock().map(|j| j.clone()).unwrap_or_default()
     }
@@ -171,6 +248,84 @@ impl JobManager {
             });
         }).ok();
     }
+}
+
+fn zip_safe_options() -> zip::write::FileOptions {
+    zip::write::FileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .compression_level(Some(6))
+}
+
+/// Recursively add `path` (named `top`) under the archive at virtual dir `vdir`.
+fn add_to_zip(
+    zw: &mut zip::ZipWriter<std::fs::File>,
+    vdir: &mut Vec<String>,
+    path: &Path,
+    top: &str,
+) -> std::io::Result<()> {
+    vdir.push(top.to_string());
+    let rel = vdir.join("/");
+    if path.is_dir() {
+        zw.add_directory(format!("{rel}/"), zip_safe_options())?;
+        for e in std::fs::read_dir(path)?.flatten() {
+            add_to_zip(zw, vdir, &e.path(), &e.file_name().to_string_lossy())?;
+        }
+    } else {
+        zw.start_file(rel, zip_safe_options())?;
+        let mut fh = std::fs::File::open(path)?;
+        std::io::copy(&mut fh, zw)?;
+    }
+    vdir.pop();
+    Ok(())
+}
+
+/// Create a .zip containing `sources` (files and/or whole folder trees).
+pub fn create_zip(sources: &[std::path::PathBuf], dest_zip: &Path) -> std::io::Result<()> {
+    let f = std::fs::File::create(dest_zip)?;
+    let mut zw = zip::ZipWriter::new(f);
+    for src in sources {
+        if src == dest_zip || (dest_zip.starts_with(src) && src.is_dir()) && src.is_dir() {
+            continue; // never include the archive being written
+        }
+        let top = src.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "item".into());
+        add_to_zip(&mut zw, &mut Vec::new(), src, &top)?;
+    }
+    zw.finish()?;
+    Ok(())
+}
+
+/// Natively extract every entry of a .zip into dest_dir (overwrites, zip-slip safe).
+pub fn extract_zip_all(archive: &Path, dest_dir: &Path) -> std::io::Result<u64> {
+    let f = std::fs::File::open(archive)?;
+    let mut z = zip::ZipArchive::new(f)
+        .map_err(|e| std::io::Error::other(format!("zip: {e}")))?;
+    for i in 0..z.len() {
+        let mut e = z.by_index(i).map_err(|e| std::io::Error::other(format!("zip: {e}")))?;
+        let name = e.name().replace('\\', "/");
+        let name = name.trim_start_matches('/');
+        if name.split('/').any(|s| s == ".." || s.is_empty() && !name.contains('/')) {
+            continue; // zip-slip guard
+        }
+        let out = dest_dir.join(name);
+        if e.is_dir() {
+            std::fs::create_dir_all(&out)?;
+        } else {
+            if let Some(par) = out.parent() { std::fs::create_dir_all(par)?; }
+            let mut w = std::fs::File::create(&out)?;
+            std::io::copy(&mut e, &mut w)?;
+        }
+    }
+    Ok(z.len() as u64)
+}
+
+/// Natively extract a .7z via sevenz-rust (LZMA/LZMA2/BCJ etc.).
+pub fn extract_7z(archive: &Path, dest_dir: &Path) -> std::io::Result<u64> {
+    std::fs::create_dir_all(dest_dir)?;
+    sevenz_rust::decompress_file(archive, dest_dir)
+        .map_err(|e| std::io::Error::other(format!("7z: {e}")))?;
+    Ok(1)
 }
 
 fn transfer_one(
@@ -273,5 +428,61 @@ mod tests {
         jm.enqueue_delete(vec![PathBuf::from("/nonexistent/__hd_no_such__")]);
         let res = wait_done(&jm, Duration::from_secs(10));
         assert_eq!(res, Some(false), "missing path should fail the job, not hang");
+    }
+
+    #[test]
+    fn zip_compress_extract_roundtrip() {
+        let tmp = std::env::temp_dir().join(format!("hd_ziptest_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp.join("tree/leaf")).unwrap();
+        std::fs::write(tmp.join("top.txt"), "hello top").unwrap();
+        std::fs::write(tmp.join("tree/leaf/inner.txt"), "hello inner").unwrap();
+
+        let zip_path = tmp.join("out.zip");
+        create_zip(&[tmp.join("top.txt"), tmp.join("tree")], &zip_path).unwrap();
+
+        let dest = tmp.join("out");
+        let n = extract_zip_all(&zip_path, &dest).unwrap();
+        assert!(n >= 3, "expected at least 3 entries, got {n}");
+        assert_eq!(std::fs::read_to_string(dest.join("top.txt")).unwrap(), "hello top");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("tree/leaf/inner.txt")).unwrap(),
+            "hello inner"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn zip_extract_rejects_path_traversal() {
+        let tmp = std::env::temp_dir().join(format!("hd_ezztest_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // hand-craft a zip whose entry points to ../escape.txt
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        writer.start_file("../escape.txt", zip_safe_options()).unwrap();
+        std::io::Write::write_all(&mut writer, b"pwn").unwrap();
+        let buf = writer.finish().unwrap().into_inner();
+        let zpath = tmp.join("evil.zip");
+        std::fs::write(&zpath, &buf).unwrap();
+        let dest = tmp.join("d");
+        std::fs::create_dir_all(&dest).unwrap();
+
+        extract_zip_all(&zpath, &dest).unwrap();
+        assert!(!dest.join("..").join("escape.txt").exists(), "zip-slip let file escape!");
+        assert!(!dest.join("escape.txt").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sevenz_garbage_input_fails_cleanly() {
+        let tmp = std::env::temp_dir().join(format!("hd_7ztest_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let bad = tmp.join("bad.7z");
+        std::fs::write(&bad, b"not a real 7z archive at all").unwrap();
+        let r = extract_7z(&bad, &tmp.join("out"));
+        assert!(r.is_err(), "garbage input must error, not hang");
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
