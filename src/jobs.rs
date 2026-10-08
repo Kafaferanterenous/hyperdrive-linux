@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use std::io::{Read, Write};
+use std::io::Read;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum JobKind {
@@ -164,11 +164,11 @@ impl JobManager {
     pub fn enqueue_extract_zip(&self, archive: PathBuf, dest_dir: PathBuf) {
         let label = format!("Extract {} \u{2192} {}", archive.display(), dest_dir.display());
         let done = Arc::new(AtomicU64::new(0));
-        let cancel = Arc::new(AtomicBool::new(true)); // unused; total is counts not bytes
+        let cancel = Arc::new(AtomicBool::new(true));
         let job = Job { label, total: 100, done: done.clone(), cancel, state: JobState::Running, error: None };
         let arc = self.register(job);
         self.spawn(move || {
-            match extract_zip_all(&archive, &dest_dir) {
+            match extract_zip_all(&archive, &dest_dir, Some(&done)) {
                 Ok(_) => {
                     if let Ok(mut j) = arc.lock() {
                         j.done.store(100, Ordering::Relaxed);
@@ -179,6 +179,32 @@ impl JobManager {
                     if let Ok(mut j) = arc.lock() {
                         j.state = JobState::Failed;
                         j.error = Some(format!("{}: {e}", archive.display()));
+                    }
+                }
+            }
+        });
+    }
+
+    /// Integrity-check a .zip / .7z without extracting.
+    pub fn enqueue_check(&self, archive: PathBuf) {
+        let label = format!("Check {}", archive.display());
+        let done = Arc::new(AtomicU64::new(0));
+        let cancel = Arc::new(AtomicBool::new(true));
+        let job = Job { label: label.clone(), total: 100, done: done.clone(), cancel, state: JobState::Running, error: None };
+        let arc = self.register(job);
+        self.spawn(move || {
+            match archive_check(&archive) {
+                Ok(msg) => {
+                    if let Ok(mut j) = arc.lock() {
+                        j.done.store(100, Ordering::Relaxed);
+                        j.state = JobState::Done;
+                        j.label = format!("{label} \u{2713} ({msg})");
+                    }
+                }
+                Err(e) => {
+                    if let Ok(mut j) = arc.lock() {
+                        j.state = JobState::Failed;
+                        j.error = Some(format!("{}", e));
                     }
                 }
             }
@@ -279,6 +305,51 @@ fn add_to_zip(
     Ok(())
 }
 
+/// Natively check a .zip / .7z for integrity (reads every entry).
+pub fn archive_check(archive: &Path) -> std::io::Result<String> {
+    let lower = archive.to_string_lossy().to_lowercase();
+    if lower.ends_with(".zip") {
+        let f = std::fs::File::open(archive)?;
+        let mut z = zip::ZipArchive::new(f)
+            .map_err(|e| std::io::Error::other(format!("zip: {e}")))?;
+        let total = z.len();
+        let mut n = 0u64;
+        for i in 0..total {
+            let mut e = z.by_index(i).map_err(|e| std::io::Error::other(format!("zip: {e}")))?;
+            let mut buf = [0u8; 65536];
+            loop {
+                match e.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) => return Err(std::io::Error::other(format!("zip: {e}"))),
+                }
+            }
+            n += 1;
+        }
+        Ok(format!("{n} entries OK"))
+    } else if lower.ends_with(".7z") {
+        let mut rd = sevenz_rust::SevenZReader::open(archive, sevenz_rust::Password::empty())
+            .map_err(|e| std::io::Error::other(format!("7z: {e}")))?;
+        let mut n = 0u64;
+        rd.for_each_entries(|_entry, mut rdr| {
+            let mut buf = [0u8; 65536];
+            loop {
+                match rdr.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) => return Err(sevenz_rust::Error::other(format!("read: {e}"))),
+                }
+            }
+            n += 1;
+            Ok(true)
+        })
+        .map_err(|e| std::io::Error::other(format!("7z: {e}")))?;
+        Ok(format!("{n} entries OK"))
+    } else {
+        Ok("not a zip/7z (skipped)".into())
+    }
+}
+
 /// Create a .zip containing `sources` (files and/or whole folder trees).
 pub fn create_zip(sources: &[std::path::PathBuf], dest_zip: &Path) -> std::io::Result<()> {
     let f = std::fs::File::create(dest_zip)?;
@@ -297,10 +368,15 @@ pub fn create_zip(sources: &[std::path::PathBuf], dest_zip: &Path) -> std::io::R
 }
 
 /// Natively extract every entry of a .zip into dest_dir (overwrites, zip-slip safe).
-pub fn extract_zip_all(archive: &Path, dest_dir: &Path) -> std::io::Result<u64> {
+pub fn extract_zip_all(
+    archive: &Path,
+    dest_dir: &Path,
+    progress: Option<&AtomicU64>,
+) -> std::io::Result<u64> {
     let f = std::fs::File::open(archive)?;
     let mut z = zip::ZipArchive::new(f)
         .map_err(|e| std::io::Error::other(format!("zip: {e}")))?;
+    let total = z.len().max(1);
     for i in 0..z.len() {
         let mut e = z.by_index(i).map_err(|e| std::io::Error::other(format!("zip: {e}")))?;
         let name = e.name().replace('\\', "/");
@@ -316,6 +392,12 @@ pub fn extract_zip_all(archive: &Path, dest_dir: &Path) -> std::io::Result<u64> 
             let mut w = std::fs::File::create(&out)?;
             std::io::copy(&mut e, &mut w)?;
         }
+        if let Some(p) = progress {
+            p.store((i * 100 / total) as u64, Ordering::Relaxed);
+        }
+    }
+    if let Some(p) = progress {
+        p.store(100, Ordering::Relaxed);
     }
     Ok(z.len() as u64)
 }
@@ -442,7 +524,7 @@ mod tests {
         create_zip(&[tmp.join("top.txt"), tmp.join("tree")], &zip_path).unwrap();
 
         let dest = tmp.join("out");
-        let n = extract_zip_all(&zip_path, &dest).unwrap();
+        let n = extract_zip_all(&zip_path, &dest, None).unwrap();
         assert!(n >= 3, "expected at least 3 entries, got {n}");
         assert_eq!(std::fs::read_to_string(dest.join("top.txt")).unwrap(), "hello top");
         assert_eq!(
@@ -468,7 +550,7 @@ mod tests {
         let dest = tmp.join("d");
         std::fs::create_dir_all(&dest).unwrap();
 
-        extract_zip_all(&zpath, &dest).unwrap();
+        extract_zip_all(&zpath, &dest, None).unwrap();
         assert!(!dest.join("..").join("escape.txt").exists(), "zip-slip let file escape!");
         assert!(!dest.join("escape.txt").exists());
         let _ = std::fs::remove_dir_all(&tmp);
@@ -483,6 +565,27 @@ mod tests {
         std::fs::write(&bad, b"not a real 7z archive at all").unwrap();
         let r = extract_7z(&bad, &tmp.join("out"));
         assert!(r.is_err(), "garbage input must error, not hang");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn archive_check_reports_ok_and_catches_corruption() {
+        let tmp = std::env::temp_dir().join(format!("hd_checktest_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("a.txt"), "hello a").unwrap();
+        std::fs::write(tmp.join("b.txt"), "hello b").unwrap();
+        let zip_path = tmp.join("ok.zip");
+        create_zip(&[tmp.join("a.txt"), tmp.join("b.txt")], &zip_path).unwrap();
+        let msg = archive_check(&zip_path).unwrap_or_else(|e| panic!("check failed: {e}"));
+        assert!(msg.contains("2 entries OK"), "got: {msg}");
+        // corrupt a byte in the stream and expect an error
+        let mut bytes = std::fs::read(&zip_path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xFF;
+        let bad_path = tmp.join("bad.zip");
+        std::fs::write(&bad_path, &bytes).unwrap();
+        assert!(archive_check(&bad_path).is_err(), "corrupt zip must fail the check");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

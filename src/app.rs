@@ -736,7 +736,7 @@ impl Pane {
                         if ui.add_enabled(sel_any, egui::Button::new("Create Symlink").min_size(w)).clicked() {
                             self.action_req = Some(RowAction::Symlink); ui.close_menu();
                         }
-                        if ui.add_enabled(sel_any, egui::Button::new("Send to Desktop").min_size(w)).clicked() {
+                        if ui.add_enabled(sel_any, egui::Button::new("Create shortcut").min_size(w)).clicked() {
                             self.action_req = Some(RowAction::DesktopLink); ui.close_menu();
                         }
                         if ui.add_enabled(sel_any, egui::Button::new("Compress to ZIP...").min_size(w)).clicked() {
@@ -758,6 +758,10 @@ impl Pane {
                         if is_archive && ui.add_enabled(true,
                             egui::Button::new("Extract here...").min_size(w)).clicked() {
                             self.action_req = Some(RowAction::Extract(path.clone())); ui.close_menu();
+                        }
+                        if is_archive && ui.add_enabled(true,
+                            egui::Button::new("Test archive").min_size(w)).clicked() {
+                            self.action_req = Some(RowAction::TestArchive(path.clone())); ui.close_menu();
                         }
                         ui.menu_button("\u{1F3F7} Tag", |ui| {
                             for (name, hex) in crate::tags::TAG_COLORS {
@@ -1029,6 +1033,7 @@ pub enum RowAction {
     Symlink,
     DesktopLink,
     CompressZip(Vec<String>),
+    TestArchive(PathBuf),
     Trash,
     DeletePermanent,
     Props,
@@ -1621,6 +1626,20 @@ impl HyperDriveApp {
                     changed_any = true;
                 }
                 ui.separator();
+                ui.heading("Shortcuts");
+                ui.label(egui::RichText::new("Where \"Create shortcut...\" places the link").small());
+                for (val, label) in [("desktop", "Desktop"), ("menu", "Applications menu"), ("taskbar", "Taskbar")] {
+                    if ui
+                        .radio_value(&mut self.settings.shortcut_dest, val.to_string(), label)
+                        .changed()
+                    {
+                        changed_any = true;
+                    }
+                }
+                ui.label(egui::RichText::new(
+                    "menu / taskbar register a .desktop launcher in XDG applications"
+                ).small());
+                ui.separator();
                 ui.heading("Text");
                 if ui
                     .add(egui::Slider::new(&mut self.settings.font_size, 12.0..=28.0).text("Font size"))
@@ -1877,42 +1896,20 @@ impl HyperDriveApp {
             }
             ui.close_menu();
         }
-        if ui.add_enabled(has_sel && cfg!(unix), egui::Button::new("Send to Desktop...")).clicked() {
-            let these: Vec<std::path::PathBuf> = sel_snapshot.clone();
-            let paths = these;
-            if !paths.is_empty() {
-                let desktop = Self::desktop_dir();
-                if std::fs::create_dir_all(&desktop).is_err() && !desktop.is_dir() {
-                    self.panes[0].last_error = Some("desktop folder unavailable (no ~/Desktop)".into());
-                    self.panes[0].err_ttl = 480;
-                } else {
-                    for src in paths {
-                        let base = src.file_name()
-                            .map(|x| x.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| "link".into());
-                        let mut name = format!("Link to {base}");
-                        let mut n = 1;
-                        while desktop.join(&name).exists() {
-                            n += 1;
-                            name = format!("Link to {base} ({n})");
-                        }
-                        #[cfg(unix)]
-                        if let Err(e) = std::os::unix::fs::symlink(&src, desktop.join(&name)) {
-                            self.panes[0].last_error = Some(format!("desktop link: {e}"));
-                            self.panes[0].err_ttl = 480;
-                        }
-                    }
-                }
-                self.active_pane().reload();
-            }
+        if ui.add_enabled(has_sel && cfg!(unix), egui::Button::new("Create shortcut...")).clicked() {
+            self.send_to_desktop();
             ui.close_menu();
         }
         if ui.add_enabled(has_sel, egui::Button::new("Compress to ZIP...")).clicked() {
             let dir = self.panes[self.settings.active_pane.min(1)].history.current.clone();
-            let first = sel_snapshot.first()
-                .map(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+            let mut names: Vec<String> = sel_snapshot.iter()
+                .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+                .collect();
+            names.sort();
+            let stem = names.first().map(|s| s.as_str()).unwrap_or("selection");
+            let name = self.unique_archive_name(&dir, stem);
             self.dialog = Dialog::CompressZip {
-                name: first.unwrap_or_else(|| "selection".into()),
+                name,
                 sources: sel_snapshot.clone(),
                 dir,
             };
@@ -2168,16 +2165,20 @@ impl HyperDriveApp {
                             let mut n = name.trim().to_string();
                             if n.is_empty() { n = "selection".into(); }
                             if !n.to_lowercase().ends_with(".zip") { n.push_str(".zip"); }
-                            let dest = dir.join(&n);
+                            let mut dest = dir.join(&n);
                             if dest.exists() {
-                                self.panes[self.settings.active_pane.min(1)].last_error =
-                                    Some(format!("{n} already exists"));
-                                self.panes[self.settings.active_pane.min(1)].err_ttl = 480;
-                            } else {
-                                self.jobman.enqueue_compress(sources.clone(), dest);
-                                self.show_jobs = true;
-                                self.dialog = Dialog::None;
+                                // auto-uniquify so multi-file compress always works
+                                let base = n.trim_end_matches(".zip").to_string();
+                                dest = dir.join(format!("{}.zip", self.unique_archive_name(&dir, &base)));
+                                name = dest.file_name()
+                                    .map(|x| x.to_string_lossy().into_owned())
+                                    .unwrap_or(n)
+                                    .trim_end_matches(".zip")
+                                    .to_string();
                             }
+                            self.jobman.enqueue_compress(sources.clone(), dest);
+                            self.show_jobs = true;
+                            self.dialog = Dialog::None;
                         }
                         if ui.button("Cancel").clicked() { self.dialog = Dialog::None; }
                     });
@@ -2899,10 +2900,14 @@ if i.modifiers.shift {
             CompressZip(names) => {
                 let dir = self.panes[idx].history.current.clone();
                 let sources: Vec<PathBuf> = names.iter().map(|n| dir.join(n)).collect();
-                let first = names.first()
-                    .map(|n| Path::new(n).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+                let mut stems: Vec<String> = names.iter()
+                    .filter_map(|n| Path::new(n).file_stem().map(|s| s.to_string_lossy().into_owned()))
+                    .collect();
+                stems.sort();
+                let stem = stems.first().map(|s| s.as_str()).unwrap_or("selection");
+                let name = self.unique_archive_name(&dir, stem);
                 self.dialog = Dialog::CompressZip {
-                    name: first.unwrap_or_else(|| "selection".into()),
+                    name,
                     sources,
                     dir,
                 };
@@ -2916,6 +2921,10 @@ DeletePermanent => {
                 self.confirm_or_delete(names);
             }
             Props => self.open_properties(),
+            TestArchive(arch) => {
+                self.jobman.enqueue_check(arch);
+                self.show_jobs = true;
+            }
             Extract(arch) => {
                 let dest = arch.parent().unwrap_or(Path::new("/")).to_path_buf();
                 let name = arch.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -3006,36 +3015,89 @@ DeletePermanent => {
             .join("Desktop")
     }
 
+    /// Suggest a non-colliding archive base name in `dir`, e.g. "page5 (2)".
+    fn unique_archive_name(&self, dir: &Path, stem: &str) -> String {
+        let stem = stem.trim();
+        if stem.is_empty() { return "selection".into(); }
+        if !dir.join(format!("{stem}.zip")).exists() { return stem.into(); }
+        let mut k = 2;
+        loop {
+            let cand = format!("{stem} ({k})");
+            if !dir.join(format!("{cand}.zip")).exists() { return cand; }
+            k += 1;
+        }
+    }
+
     /// Create a symlink to each selected item on the desktop (a desktop shortcut).
     fn send_to_desktop(&mut self) {
         let idx = self.settings.active_pane.min(1);
         let paths = selected_paths(&self.panes[idx]);
         if paths.is_empty() { return; }
-        let desktop = Self::desktop_dir();
-        if std::fs::create_dir_all(&desktop).is_err() && !desktop.is_dir() {
-            self.panes[idx].last_error = Some("desktop folder unavailable (no ~/Desktop)".into());
-            self.panes[idx].err_ttl = 480;
-            return;
-        }
         let pane = &mut self.panes[idx];
+        let dest = self.settings.shortcut_dest.clone();
         for src in paths {
             let base = src.file_name()
                 .map(|x| x.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "link".into());
-            let mut name = format!("Link to {base}");
-            let mut n = 1;
-            while desktop.join(&name).exists() {
-                n += 1;
-                name = format!("Link to {base} ({n})");
-            }
-            #[cfg(unix)]
-            if let Err(e) = std::os::unix::fs::symlink(&src, desktop.join(&name)) {
-                pane.last_error = Some(format!("desktop link: {e}"));
+            let err = match dest.as_str() {
+                "menu" => Self::launcher_shortcut("menu", &base, &src),
+                "taskbar" => Self::launcher_shortcut("taskbar", &base, &src),
+                _ => {
+                    let desktop = Self::desktop_dir();
+                    if std::fs::create_dir_all(&desktop).is_err() && !desktop.is_dir() {
+                        Err(std::io::Error::new(std::io::ErrorKind::NotFound,
+                            "desktop folder unavailable (no ~/Desktop)"))
+                    } else {
+                        let mut name = format!("Link to {base}");
+                        let mut n = 1;
+                        while desktop.join(&name).exists() {
+                            n += 1;
+                            name = format!("Link to {base} ({n})");
+                        }
+                        #[cfg(unix)]
+                        { std::os::unix::fs::symlink(&src, desktop.join(&name)) }
+                        #[cfg(not(unix))]
+                        { std::fs::copy(&src, desktop.join(&name)).map(|_| ()) }
+                    }
+                }
+            };
+            if let Err(e) = err {
+                pane.last_error = Some(format!("shortcut: {e}"));
                 pane.err_ttl = 480;
                 return;
             }
         }
         self.panes[idx].reload();
+    }
+
+    /// Write a .desktop launcher so the shortcut shows in the applications
+    /// menu (and thus can be pinned to a panel/taskbar by the DE).
+    fn launcher_shortcut(_kind: &str, base: &str, target: &Path) -> std::io::Result<()> {
+        let apps_dir = std::env::var_os("XDG_DATA_HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| browser::home_dir().join(".local/share"))
+            .join("applications");
+        std::fs::create_dir_all(&apps_dir)?;
+        let mut name = format!("Link to {base}.desktop");
+        let mut n = 1;
+        while apps_dir.join(&name).exists() {
+            n += 1;
+            name = format!("Link to {base} ({n}).desktop");
+        }
+        let quoted = target.display().to_string().replace('\'', "'\\''");
+        let body = format!(
+            "[Desktop Entry]\nVersion=1.0\nType=Application\nName=Link to {base}\n\
+             Comment=Shortcut to {} (created by HyperDrive)\nExec=xdg-open '{}'\n\
+             Icon=system-file-manager\nTerminal=false\nStartupNotify=false\n",
+            target.display(),
+            quoted,
+        );
+        std::fs::write(apps_dir.join(&name), body)?;
+        // Refresh the desktop database so the menu picks it up immediately.
+        if which_exists("update-desktop-database") {
+            let _ = std::process::Command::new("update-desktop-database").arg(&apps_dir).status();
+        }
+        Ok(())
     }
 
     /// Copy (cut=false) or move (true) current selection to the other pane's dir.

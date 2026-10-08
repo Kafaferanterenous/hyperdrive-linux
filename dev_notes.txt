@@ -616,3 +616,38 @@ SESSION 19 - 2026-10-07 (built-in ZIP compress + native ZIP/7z extract)
 - Verified live on the low-RAM box: select page5.pdf -> Compress to ZIP
   -> page5.zip valid (entries logged); Extract here -> job done, target
   restored from the archive. AppImage rebuilt and released.
+
+SESSION 21 - 2026-10-08 (shortcut destination, Test archive, multi-select compress fix)
+--------------------------------------------------------------------------------------
+- USER REQUEST: Settings choice for WHERE "Create shortcut..." puts the link
+  (Desktop / Applications menu / Taskbar). Delivered in Settings -> Shortcuts
+  radios (config key shortcut_dest: desktop|menu|taskbar, default desktop):
+  * desktop  -> symlink on XDG_DESKTOP_DIR / ~/Desktop ("Link to <name>", (n)).
+  * menu     -> .desktop launcher in XDG_DATA_HOME/share/applications
+    Exec=xdg-open '<path>' (single-quote escaped), +best-effort
+    update-desktop-database.
+  * taskbar  -> same XDG launcher (panel pinning is DE-dependent).
+  File + context items renamed "Send to Desktop" -> "Create shortcut...".
+- USER REPORTED BUG: "compress with zip from right click when two files
+  selected did not work." Root cause: the naming dialog pre-filled the zip
+  name from the first selected file, and page5.zip already existed in the
+  folder -> "already exists" bail, no job. Fix:
+  * unique_archive_name(dir, stem) - auto-" (n)" as the dialog prefill, so
+    two-file compress now lands on a free name deterministically (stems are
+    sorted; HashSet iteration order no longer leaks into the default name).
+  * Dialog Create also auto-uniquifies if the typed name exists.
+- NICE-TO-HAVE: context menu "Test archive" (RowAction::TestArchive ->
+  enqueue_check, zip crate full-read CRC / sevenz entry walk). Jobs line
+  shows "Check <path> OK (N entries OK)" or fail. Also per-entry incremental
+  progress in extract_zip_all (entry-scaled, shows during big extractions).
+- jobs.rs: archive_check() (+ enqueue_check), extract progress param.
+  Tests: archive_check_reports_ok_and_catches_corruption. Suite now 17/17.
+- INFRA: .github/workflows/ci.yml is LINUX-ONLY now - removed macOS/windows
+  from the matrix. This is a single-platform (Linux) project; do NOT let CI
+  or docs imply other OS builds. (Cross-platform handled separately.)
+- VERIFIED LIVE on the low-RAM box: 5-item multi-select -> page1.zip (5
+  entries, valid); re-compress auto-suggested "page1 (2)" and created it
+  without touching page1.zip; context "Test archive" -> page5.zip OK
+  (1 entries OK); shortcut created as menubar launcher, taskbar launcher,
+  and desktop symlink for all three Settings destinations. Config restored
+  to pre_test afterwards. AppImage rebuilt and released.
